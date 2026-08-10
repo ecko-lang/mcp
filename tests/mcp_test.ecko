@@ -1,0 +1,269 @@
+# Offline tests. Every one runs against `mcp.fake`, so the suite never opens a
+# socket - which is what makes the protocol layer testable at all, and why the
+# transport is a value rather than a hardcoded HTTP call.
+
+import std.test
+import std.json
+import "../main.ecko"
+mcp = main
+
+## A server that answers from a table, and records what it was asked.
+fn server(replies) {
+    seen = cell([])
+    t = mcp.fake(fn(req) {
+        cell_update(seen, fn(s) push(s, req))
+        id = get(req, "id")
+        r = get(replies, req.method)
+        if is_null(r) { return { jsonrpc: "2.0", id: id, result: {} } }
+        insert(r, "id", id)
+    })
+    { transport: t, seen: seen }
+}
+
+fn ok(result) = { jsonrpc: "2.0", result: result }
+
+fn basic() = { initialize: ok({ protocolVersion: "2025-06-18", capabilities: { tools: {} } }) }
+
+# ------------------------------------------------------------------ handshake
+
+test.case("connect sends initialize and then the initialized notification", fn() {
+    s = server(basic())
+    mcp.connect(s.transport)
+    sent = cell_get(s.seen)
+    test.ok(len(sent) == 2, "len(sent) == 2")
+    test.ok(sent[0].method == "initialize", "sent[0].method == 'initialize'")
+    # The spec requires the notification before any other call, and requires it
+    # to be a notification - an id here would make the server reply to it.
+    test.ok(
+        sent[1].method == "notifications/initialized",
+        "sent[1].method == 'notifications/initialized'",
+    )
+    test.ok(is_null(get(sent[1], "id")), "is_null(get(sent[1], 'id'))")
+})
+
+test.case("connect sends the protocol version and client info", fn() {
+    s = server(basic())
+    mcp.connect(s.transport, { name: "app", version: "2.0" })
+    p = cell_get(s.seen)[0].params
+    test.ok(p.protocolVersion == mcp.PROTOCOL_VERSION, "p.protocolVersion == mcp.PROTOCOL_VERSION")
+    test.ok(p.clientInfo.name == "app", "p.clientInfo.name == 'app'")
+    test.ok(p.clientInfo.version == "2.0", "p.clientInfo.version == '2.0'")
+})
+
+test.case("the server's reply is readable off the session", fn() {
+    s = server(basic())
+    session = mcp.connect(s.transport)
+    test.ok(
+        mcp.server_version(session) == "2025-06-18",
+        "mcp.server_version(session) == '2025-06-18'",
+    )
+    test.ok(
+        not is_null(get(mcp.server_capabilities(session), "tools")),
+        "not is_null(get(mcp.server_capabilities(session), 'tool...",
+    )
+})
+
+test.case("request ids increase and never repeat", fn() {
+    # Two requests sharing an id is the bug that makes a reply land on the wrong
+    # call, so this is worth pinning rather than assuming.
+    s = server(basic())
+    session = mcp.connect(s.transport)
+    mcp.call(session, "tools/list")
+    mcp.call(session, "tools/list")
+    ids = []
+    for m in cell_get(s.seen) {
+        i = get(m, "id")
+        unless is_null(i) { ids = push(ids, i) }
+    }
+    test.ok(len(ids) == 3, "len(ids) == 3")
+    test.ok(ids[0] != ids[1], "ids[0] != ids[1]")
+    test.ok(ids[1] != ids[2], "ids[1] != ids[2]")
+})
+
+# ---------------------------------------------------------------------- tools
+
+test.case("tools lists what the server offers", fn() {
+    s = server(
+        insert(basic(), "tools/list", ok({ tools: [{ name: "search" }, { name: "fetch" }] })),
+    )
+    session = mcp.connect(s.transport)
+    names = map(mcp.tools(session), fn(t) t.name)
+    test.ok(names == ["search", "fetch"], "names == ['search', 'fetch']")
+})
+
+test.case("a server with no tools key reads as no tools", fn() {
+    # `{}` and `{"tools": []}` mean the same thing to a caller iterating.
+    s = server(insert(basic(), "tools/list", ok({})))
+    session = mcp.connect(s.transport)
+    test.ok(mcp.tools(session) == [], "mcp.tools(session) == []")
+})
+
+test.case("call_tool passes the name and arguments through", fn() {
+    s = server(insert(basic(), "tools/call", ok({ content: [] })))
+    session = mcp.connect(s.transport)
+    mcp.call_tool(session, "search", { query: "ecko", limit: 3 })
+    last = cell_get(s.seen)[2]
+    test.ok(last.method == "tools/call", "last.method == 'tools/call'")
+    test.ok(last.params.name == "search", "last.params.name == 'search'")
+    test.ok(last.params.arguments.query == "ecko", "last.params.arguments.query == 'ecko'")
+    test.ok(last.params.arguments.limit == 3, "last.params.arguments.limit == 3")
+})
+
+test.case("text_of joins the text parts and ignores the rest", fn() {
+    r = {
+        content: [
+            { type: "text", text: "hello " },
+            { type: "image", data: "..." },
+            { type: "text", text: "world" },
+        ],
+    }
+    test.ok(mcp.text_of(r) == "hello world", "mcp.text_of(r) == 'hello world'")
+})
+
+test.case("text_of on a result with no content is empty", fn() {
+    test.ok(mcp.text_of({}) == "", "mcp.text_of() == ''")
+})
+
+test.case("is_error reads the tool's own failure flag", fn() {
+    # A failed tool is a successful call carrying isError, not a JSON-RPC error.
+    test.ok(
+        mcp.is_error({ content: [], isError: true }),
+        "mcp.is_error( content: [], isError: true )",
+    )
+    test.ok(not mcp.is_error({ content: [] }), "not mcp.is_error( content: [] )")
+})
+
+# ------------------------------------------------------ resources and prompts
+
+test.case("resources and read_resource return their lists", fn() {
+    s = server(
+        insert(
+            insert(basic(), "resources/list", ok({ resources: [{ uri: "file:///a" }] })),
+            "resources/read",
+            ok({ contents: [{ uri: "file:///a", text: "body" }] }),
+        ),
+    )
+    session = mcp.connect(s.transport)
+    test.ok(
+        mcp.resources(session)[0].uri == "file:///a",
+        "mcp.resources(session)[0].uri == 'file:///a'",
+    )
+    test.ok(
+        mcp.read_resource(session, "file:///a")[0].text == "body",
+        "mcp.read_resource(session, 'file:///a')[0].text == 'body'",
+    )
+})
+
+test.case("prompts and get_prompt return their lists", fn() {
+    s = server(
+        insert(
+            insert(basic(), "prompts/list", ok({ prompts: [{ name: "review" }] })),
+            "prompts/get",
+            ok({ messages: [{ role: "user" }] }),
+        ),
+    )
+    session = mcp.connect(s.transport)
+    test.ok(mcp.prompts(session)[0].name == "review", "mcp.prompts(session)[0].name == 'review'")
+    test.ok(
+        mcp.get_prompt(session, "review", { lang: "rust" })[0].role == "user",
+        "mcp.get_prompt(session, 'review', lang: 'rust' )[0]....",
+    )
+})
+
+# --------------------------------------------------------------------- errors
+
+test.case("a JSON-RPC error becomes an Ecko error carrying code and message", fn() {
+    s = server(
+        insert(
+            basic(),
+            "tools/call",
+            { jsonrpc: "2.0", error: { code: -32602, message: "bad argument" } },
+        ),
+    )
+    session = mcp.connect(s.transport)
+    caught = try {
+        mcp.call_tool(session, "x")
+        ""
+    } catch (e) { e.message }
+    test.ok(contains(caught, "-32602"), "contains(caught, '-32602')")
+    test.ok(contains(caught, "bad argument"), "contains(caught, 'bad argument')")
+})
+
+test.case("an error carries kind mcp so a caller can match on it", fn() {
+    s = server(
+        insert(basic(), "tools/call", { jsonrpc: "2.0", error: { code: -1, message: "no" } }),
+    )
+    session = mcp.connect(s.transport)
+    k = try {
+        mcp.call_tool(session, "x")
+        ""
+    } catch (e) { e.kind }
+    test.ok(k == "mcp", "k == 'mcp'")
+})
+
+test.case("a reply whose id does not match the request is refused", fn() {
+    # The check that stops one call's result being attributed to another.
+    caught = try {
+        mcp.reply_for(1, json.encode({ jsonrpc: "2.0", id: 99, result: 1 }))
+        ""
+    } catch (e) { e.message }
+    test.ok(contains(caught, "does not match"), "contains(caught, 'does not match')")
+})
+
+test.case("a reply with neither result nor error is refused", fn() {
+    caught = try {
+        mcp.result_of({ jsonrpc: "2.0", id: 1 })
+        ""
+    } catch (e) { e.message }
+    test.ok(
+        contains(caught, "neither result nor error"),
+        "contains(caught, 'neither result nor error')",
+    )
+})
+
+# ------------------------------------------------------------------- framing
+
+test.case("a request carries jsonrpc 2.0, the id and the method", fn() {
+    r = mcp.request(4, "tools/list", { a: 1 })
+    test.ok(r.jsonrpc == "2.0", "r.jsonrpc == '2.0'")
+    test.ok(r.id == 4, "r.id == 4")
+    test.ok(r.method == "tools/list", "r.method == 'tools/list'")
+    test.ok(r.params.a == 1, "r.params.a == 1")
+})
+
+test.case("a notification has a method and no id", fn() {
+    n = mcp.notification("notifications/cancelled")
+    test.ok(n.method == "notifications/cancelled", "n.method == 'notifications/cancelled'")
+    test.ok(is_null(get(n, "id")), "is_null(get(n, 'id'))")
+    test.ok(mcp.is_notification(n), "mcp.is_notification(n)")
+    test.ok(
+        not mcp.is_notification(mcp.request(1, "x")),
+        "not mcp.is_notification(mcp.request(1, 'x'))",
+    )
+})
+
+# ------------------------------------------------------------- SSE body frames
+
+test.case("an SSE data frame is unwrapped to its JSON", fn() {
+    body = "event: message\ndata: " + json.encode({ jsonrpc: "2.0", id: 1, result: 5 }) + "\n\n"
+    test.ok(
+        mcp.result_of(json.decode(mcp.body_text(body))) == 5,
+        "mcp.result_of(json.decode(mcp.body_text(body))) == 5",
+    )
+})
+
+test.case("a plain JSON body is passed through untouched", fn() {
+    body = json.encode({ jsonrpc: "2.0", id: 1, result: 7 })
+    test.ok(mcp.body_text(body) == body, "mcp.body_text(body) == body")
+})
+
+test.case("a body that is neither JSON nor an SSE frame is refused", fn() {
+    caught = try {
+        mcp.body_text("<html>gateway timeout</html>")
+        ""
+    } catch (e) { e.message }
+    test.ok(
+        contains(caught, "neither JSON nor an SSE"),
+        "contains(caught, 'neither JSON nor an SSE')",
+    )
+})

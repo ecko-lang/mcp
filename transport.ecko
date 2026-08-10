@@ -1,0 +1,66 @@
+# Transports: how a JSON-RPC message gets to the server and back.
+#
+# A transport is just a map with a `send` function taking wire text and
+# returning wire text. Keeping it a value rather than a hardcoded call is what
+# lets the protocol layer be tested without a server - `fake()` below is the
+# whole test harness - and is where a stdio transport plugs in when `std.proc`
+# can write to a child's stdin.
+
+import std.http
+import "./jsonrpc.ecko" as rpc
+
+## The MCP protocol version this client speaks. Sent in `initialize`; a server
+## that does not support it answers with the version it does.
+export let PROTOCOL_VERSION = "2025-06-18"
+
+## An HTTP transport, MCP's "Streamable HTTP" shape: every request is a POST of
+## one JSON-RPC message, and the reply comes back in the response body.
+##
+## `opts` takes `headers` (for `Authorization`, which is how hosted MCP servers
+## authenticate) and `timeout` in seconds.
+##
+## Needs the **net** capability.
+export fn http_transport(url, opts = {}) {
+    headers = get(opts, "headers")
+    headers = if is_null(headers) { {} } else { headers }
+    headers = insert(headers, "Content-Type", "application/json")
+    # MCP servers may answer a POST with either JSON or an SSE stream; saying we
+    # accept both is what the spec requires of a Streamable HTTP client.
+    headers = insert(headers, "Accept", "application/json, text/event-stream")
+    { kind: "http", url: url, send: fn(text) {
+        r = http.post(url, text, headers)
+        if r.status < 200 or r.status >= 300 {
+            rpc.fail("HTTP {r.status} from {url}", { status: r.status, body: r.body })
+        }
+        body_text(r.body)
+    }, close: fn() null }
+}
+
+## Pull the JSON out of a response body that may be an SSE frame.
+##
+## A Streamable HTTP server is allowed to answer a POST with `text/event-stream`
+## instead of plain JSON, in which case the payload is on a `data:` line. Doing
+## this here keeps the protocol layer from knowing about either encoding.
+export fn body_text(body) {
+    trimmed = trim(body)
+    if starts_with(trimmed, r"{") or starts_with(trimmed, "[") { return trimmed }
+    mut payload = ""
+    for line in split(trimmed, "\n") {
+        l = trim(line)
+        if starts_with(l, "data:") { payload = payload + trim(l[5..len(l)]) }
+    }
+    if payload == "" { rpc.fail("server sent a body that is neither JSON nor an SSE data frame") }
+    payload
+}
+
+## A transport backed by a table of canned replies, for tests and examples.
+##
+## `handler` takes the decoded request map and returns the reply map. This is
+## what makes the protocol layer testable offline, which the package guide
+## requires and a network round trip would prevent.
+export fn fake(handler) {
+    { kind: "fake", url: "", send: fn(text) {
+        request = json_decode(text)
+        json_encode(handler(request))
+    }, close: fn() null }
+}

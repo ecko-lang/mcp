@@ -1,0 +1,145 @@
+# mcp - connecting an Ecko program to an MCP server.
+#
+# Runs against a stand-in server so it works offline and prints the same thing
+# every time. Swap `mcp.fake(...)` for `mcp.http_transport(url)` and the rest of
+# the program is unchanged - which is the point of the transport being a value.
+
+import "./main.ecko"
+mcp = main
+
+# --- a stand-in for a real server -------------------------------------------
+
+# A server that offers one tool and one resource. A real one is behind a URL;
+# this one is a function, so the example needs no network and no API key.
+fn demo_server() {
+    mcp.fake(fn(req) {
+        id = get(req, "id")
+        m = req.method
+
+        if m == "initialize" {
+            return {
+                jsonrpc: "2.0",
+                id: id,
+                result: {
+                    protocolVersion: mcp.PROTOCOL_VERSION,
+                    capabilities: { tools: {}, resources: {} },
+                    serverInfo: { name: "demo", version: "1.0" },
+                },
+            }
+        }
+
+        if m == "tools/list" {
+            return {
+                jsonrpc: "2.0",
+                id: id,
+                result: {
+                    tools: [
+                        {
+                            name: "word_count",
+                            description: "Count the words in some text",
+                            inputSchema: {
+                                type: "object",
+                                properties: { text: { type: "string" } },
+                            },
+                        },
+                    ],
+                },
+            }
+        }
+
+        if m == "tools/call" {
+            if req.params.name != "word_count" {
+                # An unknown tool is a protocol-level error, not a tool failure.
+                return { jsonrpc: "2.0", id: id, error: { code: -32602, message: "no such tool" } }
+            }
+            n = len(split(trim(req.params.arguments.text), " "))
+            return {
+                jsonrpc: "2.0",
+                id: id,
+                result: { content: [{ type: "text", text: string(n) }] },
+            }
+        }
+
+        if m == "resources/list" {
+            return {
+                jsonrpc: "2.0",
+                id: id,
+                result: { resources: [{ uri: "memo://readme", name: "readme" }] },
+            }
+        }
+
+        if m == "resources/read" {
+            return {
+                jsonrpc: "2.0",
+                id: id,
+                result: {
+                    contents: [
+                        {
+                            uri: req.params.uri,
+                            mimeType: "text/plain",
+                            text: "hello from the server",
+                        },
+                    ],
+                },
+            }
+        }
+
+        { jsonrpc: "2.0", id: id, result: {} }
+    })
+}
+
+# --- the handshake ----------------------------------------------------------
+
+session = mcp.connect(demo_server(), { name: "example", version: "1.0" })
+
+print("--- connected ---")
+print("protocol: {mcp.server_version(session)}")
+print("server:   {session.server.serverInfo.name}")
+
+# What the server says it can do. Branch on this rather than calling a section
+# it never advertised and catching the error.
+caps = sort(keys(mcp.server_capabilities(session)))
+print("offers:   {join(caps, \", \")}")
+print("")
+
+# --- tools ------------------------------------------------------------------
+
+print("--- tools ---")
+for t in mcp.tools(session) {
+    print("{t.name}: {t.description}")
+}
+print("")
+
+result = mcp.call_tool(session, "word_count", { text: "the quick brown fox" })
+print("word_count -> {mcp.text_of(result)}")
+
+# A tool can fail in two different ways, and they are not the same thing.
+# This one is a *protocol* error: the tool does not exist.
+missing = try {
+    mcp.call_tool(session, "no_such_tool", {})
+    "(no error)"
+} catch (e) { e.message }
+print("unknown tool -> {missing}")
+print("")
+
+# --- resources --------------------------------------------------------------
+
+print("--- resources ---")
+for r in mcp.resources(session) {
+    print("{r.uri} ({r.name})")
+}
+
+for c in mcp.read_resource(session, "memo://readme") {
+    print("body: {c.text}")
+}
+
+mcp.close(session)
+# Against a real server, the only line that changes is the transport:
+#
+#   session = mcp.connect(
+#       mcp.http_transport("https://mcp.example.com/", {
+#           headers: { Authorization: "Bearer {reveal(token)}" },
+#       }),
+#   )
+#
+# and the program needs the `net` capability.

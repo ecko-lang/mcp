@@ -1,0 +1,17 @@
+# mcp - a Model Context Protocol client.
+#
+#   import mcp
+#
+#   s = mcp.connect(mcp.http_transport("https://example.com/mcp"))
+#   for t in mcp.tools(s) { print(t.name) }
+#   print(mcp.text_of(mcp.call_tool(s, "search", { query: "ecko" })))
+#
+# MCP is JSON-RPC 2.0 with a fixed vocabulary: a handshake, then tools,
+# resources and prompts. This package speaks the HTTP transport; the transport
+# is a value, so a stdio one drops in without touching the protocol layer.
+#
+# Needs the **net** capability for the HTTP transport, and none for a fake one.
+
+export * from "./jsonrpc.ecko"
+export * from "./transport.ecko"
+export * from "./client.ecko"

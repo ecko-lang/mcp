@@ -1,0 +1,88 @@
+name: CI
+
+# The same gate `release.yml` applies, run on every push instead of only on a
+# tag. Before this existed the first thing that ever ran these checks was a
+# release, so a mistake surfaced as a tag that published nothing - the most
+# expensive place to find out.
+#
+# Deliberately identical checks to the release job, minus the tag/version
+# verification and the packaging. If the two ever disagree, a push can pass and
+# the release still fail, which is exactly the situation this removes.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+# A force-push or a quick follow-up supersedes the run in flight.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Nothing here writes. `release.yml` asks for `contents: write` because it
+# publishes; this job only reads, so it gets a token that can only read.
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      # Only this repository. That is the point: a package must pass with
+      # nothing beside it, because that is what a user gets. An import of a
+      # sibling repo ("../other/main.ecko") resolves in a local workspace
+      # checkout and nowhere else, and has shipped broken inside a release
+      # archive before.
+      - uses: actions/checkout@v4
+
+      # Packages are Ecko source, so the toolchain is the released binary - the
+      # same one release.yml installs. Pinning to `latest` is intentional: it
+      # catches the case where a new core release changes what the gate accepts,
+      # which is otherwise only discovered at release time.
+      - name: Install Ecko
+        run: |
+          curl -fSL --retry 3 --retry-delay 2 \
+            https://ecko.sh/dl/latest/ecko-x86_64-linux.tar.gz -o /tmp/ecko.tar.gz
+          mkdir -p /tmp/ecko-extract
+          tar -xzf /tmp/ecko.tar.gz -C /tmp/ecko-extract
+          bin="$(find /tmp/ecko-extract -type f -name ecko | head -1)"
+          test -n "$bin" || { echo "::error::archive has no 'ecko' binary"; exit 1; }
+          sudo install -m 0755 "$bin" /usr/local/bin/ecko
+          ecko --version
+
+      - name: Formatting
+        run: ecko fmt --check *.ecko
+
+      - name: Static analysis
+        run: ecko check *.ecko
+
+      - name: Tests
+        run: ecko test
+
+      # Every export should carry a `##` doc comment. The generated reference is
+      # part of the package's surface, and a hole in it ships to every reader.
+      - name: Require documented exports
+        run: |
+          doc="$(ecko doc main.ecko)"
+          # Without this the check is vacuous: `grep -c` reports 0 for empty
+          # input just as it does for a fully documented package, so a failing
+          # `ecko doc` would pass silently.
+          printf '%s' "$doc" | grep -q '^## `' || {
+            echo "::error::ecko doc main.ecko produced no entries - is the entrypoint right?"
+            exit 1
+          }
+          undocumented=$(printf '%s' "$doc" | grep -c 'Undocumented' || true)
+          if [ "$undocumented" != "0" ]; then
+            echo "::error::$undocumented export(s) have no ## doc comment"
+            printf '%s' "$doc" | grep -B2 'Undocumented' | grep '^## `' || true
+            exit 1
+          fi
+
+      # The tag is what publishes, so a manifest version that has already been
+      # released means the next `git tag v$version` will fail the release gate.
+      # Warn rather than fail: bumping is a release decision, not a push-time one.
+      - name: Warn if the manifest version is already tagged
+        run: |
+          version="$(jq -r .version ecko.json)"
+          if git ls-remote --tags origin "refs/tags/v$version" | grep -q .; then
+            echo "::warning::ecko.json is $version and v$version is already tagged - bump before releasing"
+          fi

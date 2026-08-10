@@ -1,0 +1,10 @@
+{
+  "module": "github.com/ecko-lang/mcp",
+  "version": "0.10.1",
+  "entrypoint": "main.ecko",
+  "description": "Model Context Protocol client: connect to an MCP server, list and call its tools, read its resources and prompts.",
+  "author": "Sean Nieuwoudt <sean@underwulf.com>",
+  "license": "MIT",
+  "capabilities": ["net"],
+  "dependencies": {}
+}

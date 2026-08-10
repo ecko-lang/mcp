@@ -1,0 +1,149 @@
+# The MCP protocol layer: the handshake, and the calls worth making.
+#
+# Everything here goes through a transport value, so none of it knows whether
+# the server is across a network or a table of canned replies.
+
+import "./jsonrpc.ecko" as rpc
+import "./transport.ecko" as tr
+
+## Open a session: send `initialize`, then the `notifications/initialized` the
+## spec requires before any other call.
+##
+## `info` names this client to the server (`{ name, version }`). Returns a
+## session value carrying the transport, the server's reply, and the request-id
+## counter - pass it to every call below.
+export fn connect(transport, info = {}) {
+    name = get(info, "name")
+    name = if is_null(name) { "ecko" } else { name }
+    version = get(info, "version")
+    version = if is_null(version) { "0.1.0" } else { version }
+
+    # `next_id` is a cell because the id has to advance across calls that each
+    # take the session by value. Every request in a connection needs its own.
+    session = { transport: transport, next_id: cell(1), server: {} }
+    result = call(
+        session,
+        "initialize",
+        {
+            protocolVersion: tr.PROTOCOL_VERSION,
+            capabilities: {},
+            clientInfo: { name: name, version: version },
+        },
+    )
+    notify(session, "notifications/initialized", {})
+    insert(session, "server", result)
+}
+
+## The protocol version the server answered with, or `null` if it did not say.
+## Worth checking: a server that does not speak our version says so here rather
+## than failing later on a call it does not implement.
+export fn server_version(session) = get(session.server, "protocolVersion")
+
+## What the server says it can do - `tools`, `resources`, `prompts` are the keys
+## worth looking for. Calling into a section the server did not advertise is a
+## protocol error, so branch on this rather than catching.
+export fn server_capabilities(session) {
+    c = get(session.server, "capabilities")
+    if is_null(c) { {} } else { c }
+}
+
+## Send one request and return its result, raising on a JSON-RPC error.
+export fn call(session, method, params = {}) {
+    id = cell_get(session.next_id)
+    cell_set(session.next_id, id + 1)
+    text = rpc.encode(rpc.request(id, method, params))
+    reply = session.transport.send(text)
+    rpc.reply_for(id, reply)
+}
+
+## Send a notification: no id, no reply, nothing to wait for.
+export fn notify(session, method, params = {}) {
+    session.transport.send(rpc.encode(rpc.notification(method, params)))
+    null
+}
+
+## Close the transport. A no-op for HTTP; the seam matters for a transport that
+## owns a socket or a child process.
+export fn close(session) = session.transport.close()
+
+# ---------------------------------------------------------------------- tools
+
+## The tools the server offers: `[{ name, description, inputSchema }]`.
+export fn tools(session) {
+    r = call(session, "tools/list", {})
+    list_field(r, "tools")
+}
+
+## Call a tool by name. `args` is the argument map its `inputSchema` describes.
+##
+## Returns the raw result, which carries `content` and may carry `isError`. Use
+## `text_of` for the common case of a tool that answers with text.
+export fn call_tool(session, name, args = {}) = call(
+    session,
+    "tools/call",
+    { name: name, arguments: args },
+)
+
+## The text parts of a tool result, joined.
+##
+## MCP returns content as a list of typed parts (`text`, `image`, `resource`);
+## this takes the text ones and leaves the rest, because a caller that wants an
+## image should reach into `content` deliberately rather than get a surprise.
+export fn text_of(result) {
+    parts = get(result, "content")
+    if is_null(parts) { return "" }
+    mut out = []
+    for p in parts {
+        if type_of(p) == "map" and get(p, "type") == "text" {
+            t = get(p, "text")
+            unless is_null(t) { out = push(out, t) }
+        }
+    }
+    join(out, "")
+}
+
+## True when the server flagged the tool result as an error. This is *not* a
+## JSON-RPC error - the call succeeded and the tool itself failed, which the
+## spec models as data so a model can read the failure and retry.
+export fn is_error(result) = get(result, "isError") == true
+
+# ------------------------------------------------------------------ resources
+
+## The resources the server exposes: `[{ uri, name, mimeType }]`.
+export fn resources(session) {
+    r = call(session, "resources/list", {})
+    list_field(r, "resources")
+}
+
+## Read one resource by URI. Returns `[{ uri, mimeType, text }]`.
+export fn read_resource(session, uri) {
+    r = call(session, "resources/read", { uri: uri })
+    list_field(r, "contents")
+}
+
+# -------------------------------------------------------------------- prompts
+
+## The prompt templates the server offers: `[{ name, description, arguments }]`.
+export fn prompts(session) {
+    r = call(session, "prompts/list", {})
+    list_field(r, "prompts")
+}
+
+## Render a prompt template. Returns the server's `messages` list.
+export fn get_prompt(session, name, args = {}) {
+    r = call(session, "prompts/get", { name: name, arguments: args })
+    list_field(r, "messages")
+}
+
+# ---------------------------------------------------------------------- shared
+
+## Read a list-valued field, treating a missing one as empty.
+##
+## A server that has no tools may answer `{}` rather than `{"tools": []}`, and
+## both mean the same thing to a caller iterating the result.
+fn list_field(result, name) {
+    v = get(result, name)
+    if is_null(v) { return [] }
+    if type_of(v) != "list" { rpc.fail("server sent a non-list '{name}'") }
+    v
+}

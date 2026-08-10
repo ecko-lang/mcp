@@ -1,0 +1,74 @@
+# JSON-RPC 2.0 framing, the wire format MCP speaks.
+#
+# Kept separate from the protocol layer because it has no opinion about MCP:
+# it builds requests, reads replies, and turns a JSON-RPC error object into an
+# Ecko error. Everything here is pure, so it tests without a server.
+
+import std.json
+
+## The error this package raises. `kind` is always "mcp", so a caller can
+## `catch (e) { if e.kind == "mcp" { ... } }` without matching on message text.
+export fn fail(message, detail = {}) {
+    error(insert({ kind: "mcp", message: message }, "detail", detail))
+}
+
+## Build a JSON-RPC request object. `id` correlates the reply; MCP requires it
+## to be unique within a connection and never null.
+export fn request(id, method, params = {}) {
+    { jsonrpc: "2.0", id: id, method: method, params: params }
+}
+
+## Build a JSON-RPC notification: a request with no `id`, which the server must
+## not reply to. MCP uses these for `notifications/initialized` and cancellation.
+export fn notification(method, params = {}) {
+    { jsonrpc: "2.0", method: method, params: params }
+}
+
+## Encode a request or notification for the wire.
+export fn encode(message) = json.encode(message)
+
+## Decode one JSON-RPC reply and return its `result`, raising the `error` object
+## if the server sent one.
+##
+## A JSON-RPC error is a normal outcome of a well-formed call - an unknown tool,
+## a bad argument - so it becomes an Ecko error carrying the server's own code
+## and message rather than a generic failure.
+export fn result_of(reply) {
+    if type_of(reply) != "map" { fail("server sent a reply that is not a JSON object") }
+    if contains(keys(reply), "error") {
+        e = reply["error"]
+        code = if type_of(e) == "map" and contains(keys(e), "code") { e["code"] } else { 0 }
+        msg = if type_of(e) == "map" and contains(keys(e), "message") {
+            e["message"]
+        } else {
+            "unknown error"
+        }
+        fail("server error {code}: {msg}", e)
+    }
+    if is_null(get(reply, "result")) and not contains(keys(reply), "result") {
+        fail("server reply has neither result nor error")
+    }
+    reply["result"]
+}
+
+## Decode a reply from wire text, checking it belongs to the request we sent.
+##
+## The id check is what makes a transport that can interleave messages safe: an
+## SSE channel carries notifications and replies to other requests on the same
+## stream, and silently accepting the first object that arrives would attribute
+## someone else's result to this call.
+export fn reply_for(id, text) {
+    reply = json.decode(text)
+    if type_of(reply) == "map" and contains(keys(reply), "id") {
+        got = reply["id"]
+        if got != id { fail("reply id {got} does not match request id {id}") }
+    }
+    result_of(reply)
+}
+
+## True when a decoded message is a notification rather than a reply - it has a
+## method and no id. A transport reading a shared stream uses this to decide
+## what to hand back and what to drop.
+export fn is_notification(message) = type_of(message) == "map" and
+    contains(keys(message), "method") and
+    not contains(keys(message), "id")

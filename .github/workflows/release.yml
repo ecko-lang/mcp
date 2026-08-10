@@ -1,0 +1,83 @@
+name: Release
+
+# Publish a package version by pushing a tag that matches ecko.json:
+#
+#   git tag v0.9.4 && git push origin v0.9.4
+#
+# The tag is the source of truth for the version, and the first job of this
+# workflow is to refuse a tag that disagrees with the manifest.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify the tag matches ecko.json
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version="$(jq -r .version ecko.json)"
+          if [ "$tag" != "$version" ]; then
+            echo "::error::tag v$tag does not match ecko.json version $version"
+            exit 1
+          fi
+
+      # Packages are Ecko source, so the toolchain is the released binary. It
+      # has no libssl dependency and a glibc 2.35 floor, so it runs here
+      # unmodified.
+      - name: Install Ecko
+        run: |
+          curl -fSL --retry 3 --retry-delay 2 \
+            https://ecko.sh/dl/latest/ecko-x86_64-linux.tar.gz -o /tmp/ecko.tar.gz
+          mkdir -p /tmp/ecko-extract
+          tar -xzf /tmp/ecko.tar.gz -C /tmp/ecko-extract
+          bin="$(find /tmp/ecko-extract -type f -name ecko | head -1)"
+          test -n "$bin" || { echo "::error::archive has no 'ecko' binary"; exit 1; }
+          sudo install -m 0755 "$bin" /usr/local/bin/ecko
+          ecko --version
+
+      # A published package that does not pass its own tests is worse than an
+      # unpublished one: it goes out under a version number people will pin.
+      - name: Check and test
+        run: |
+          ecko fmt --check *.ecko
+          ecko check *.ecko
+          ecko test
+
+      # Every export should carry a `##` doc comment. The generated reference is
+      # part of the package's surface, and a hole in it ships to every reader.
+      - name: Require documented exports
+        run: |
+          undocumented=$(ecko doc main.ecko | grep -c 'Undocumented' || true)
+          if [ "$undocumented" != "0" ]; then
+            echo "::error::$undocumented export(s) have no ## doc comment"
+            ecko doc main.ecko | grep -B2 'Undocumented' | grep '^## `' || true
+            exit 1
+          fi
+
+      - name: Pack
+        run: |
+          # Named after the repository so `ecko get github.com/<owner>/<repo>`
+          # resolves to it. The archive is the manifest plus the sources at the
+          # root, which is the layout the package resolver expects. Deliberately
+          # non-recursive: tests/ and docs/ are not needed to use the package.
+          name="${GITHUB_REPOSITORY##*/}"
+          zip -X "$name.zip" ecko.json *.ecko
+          unzip -l "$name.zip"
+          echo "PKG_ZIP=$name.zip" >> "$GITHUB_ENV"
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            "$PKG_ZIP"
