@@ -9,10 +9,6 @@
 import std.http
 import "./jsonrpc.ecko" as rpc
 
-## The MCP protocol version this client speaks. Sent in `initialize`; a server
-## that does not support it answers with the version it does.
-export let PROTOCOL_VERSION = "2025-06-18"
-
 ## An HTTP transport, MCP's "Streamable HTTP" shape: every request is a POST of
 ## one JSON-RPC message, and the reply comes back in the response body.
 ##

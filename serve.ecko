@@ -1,0 +1,69 @@
+# Transports: how requests reach `handle` and replies get back.
+#
+# Both are thin on purpose. The protocol lives in `server.ecko` and neither of
+# these knows anything about MCP beyond "one JSON object in, one out".
+
+import std.io
+import std.http
+import std.json
+import "./server.ecko" as proto
+
+## Serve over stdio: one JSON-RPC message per line on standard input, one reply
+## per line on standard output.
+##
+## This is the transport Claude Desktop and every local MCP server uses - the
+## client spawns the program and talks to it over the pipes it already has, so
+## there is no port, no URL and nothing to authenticate.
+##
+## Needs **no capability**: standard input is handed to the process by whoever
+## started it, the same way its arguments are.
+##
+##   import mcp_server as srv
+##   srv.serve_stdio([srv.tool(...)], { name: "my-server", version: "1.0" })
+##
+## Blocks until standard input closes, which is how the client says goodbye.
+export fn serve_stdio(tools, info = {}) {
+    loop {
+        line = io.read_line()
+        # End of input, not an empty line - the client closed the pipe.
+        if is_null(line) { break }
+        trimmed = trim(line)
+        if trimmed == "" { continue }
+        reply = handle_text(trimmed, tools, info)
+        # A notification produces no reply, and writing a blank line for one
+        # would desynchronise a client reading line by line.
+        unless is_null(reply) { print(reply) }
+    }
+    null
+}
+
+## Serve over HTTP: one JSON-RPC message per POST body, the reply in the
+## response body. MCP's Streamable HTTP shape, minus the optional SSE channel.
+##
+## Needs the **net** capability.
+export fn serve_http(port, tools, info = {}) {
+    http.serve(port, fn(req) {
+        if req.method != "POST" { return http.response(405, "POST a JSON-RPC message", {}) }
+        reply = handle_text(req.body, tools, info)
+        # 202 with no body is what the spec asks for on a notification: accepted,
+        # nothing to say.
+        if is_null(reply) { return http.response(202, "", {}) }
+        http.response(200, reply, { "Content-Type": "application/json" })
+    })
+}
+
+## Decode one message, answer it, and encode the reply. `null` when the message
+## was a notification.
+##
+## Malformed JSON is answered rather than thrown: a client that sends garbage
+## should get a parse error back, not a dropped connection.
+export fn handle_text(text, tools, info = {}) {
+    request = try { json.decode(text) } catch (e) {
+        return json.encode(
+            { jsonrpc: "2.0", id: null, error: { code: -32700, message: "parse error" } },
+        )
+    }
+    reply = proto.handle(request, tools, info)
+    if is_null(reply) { return null }
+    json.encode(reply)
+}

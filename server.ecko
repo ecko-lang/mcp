@@ -1,0 +1,221 @@
+# Being an MCP server: answer the protocol, run the tools.
+#
+# The inverse of the `mcp` client package. A client asks `tools/list` and
+# `tools/call`; this answers them, with Ecko functions behind the names.
+#
+# `handle` is the whole protocol and touches nothing outside itself: give it a
+# decoded request map and a tool table, get a reply map back. That is what makes
+# the protocol testable without a socket or a pipe, and why the transports below
+# are thin.
+
+import "./jsonrpc.ecko" as rpc
+
+## Declare a tool: a name, a description the model reads, a JSON Schema for its
+## arguments, and the function to run.
+##
+## `handler` takes the decoded argument map and returns either a string (the
+## common case) or a content list built with `text`.
+export fn tool(name, description, schema, handler) = {
+    name: name,
+    description: description,
+    inputSchema: schema,
+    handler: handler,
+}
+
+## Wrap a value as MCP text content: `[{ type: "text", text: ... }]`.
+##
+## MCP returns content as a list of typed parts, so even a one-line answer is a
+## list. `handle` wraps a bare string for you; this is for a handler returning
+## several parts deliberately.
+export fn text(value) = [{ type: "text", text: string(value) }]
+
+## Report a tool failure.
+##
+## This is *not* a JSON-RPC error. The call succeeded and the tool failed, which
+## MCP models as data on purpose so a model can read the failure and try
+## something else. A JSON-RPC error means the call was rejected outright.
+export fn tool_error(message) = { content: text(message), isError: true }
+
+## Declare a resource: something a client can read by URI.
+##
+## `reader` takes no arguments and returns the body as a string. Lazy on
+## purpose - a server listing fifty documents should not read fifty files to
+## answer `resources/list`.
+export fn resource(uri, name, mime_type, reader) = {
+    uri: uri,
+    name: name,
+    mimeType: mime_type,
+    reader: reader,
+}
+
+## Declare a prompt template.
+##
+## `renderer` takes the decoded argument map and returns either a string (which
+## becomes one user message) or a full `messages` list.
+export fn prompt(name, description, arguments, renderer) = {
+    name: name,
+    description: description,
+    arguments: arguments,
+    renderer: renderer,
+}
+
+## Answer one decoded JSON-RPC request. Returns the reply map, or `null` for a
+## notification, which by definition gets no reply.
+##
+## `offer` is what this server exposes: `{ tools, resources, prompts }`, each
+## optional. A bare list is taken as the tools, which is what almost every
+## server offers and keeps the common call short.
+##
+## `info` is `{ name, version }` for this server.
+export fn handle(request, offer, info = {}) {
+    offered = if type_of(offer) == "list" { { tools: offer } } else { offer }
+    tools = default_of(get(offered, "tools"), [])
+    resources = default_of(get(offered, "resources"), [])
+    prompts = default_of(get(offered, "prompts"), [])
+    method = get(request, "method")
+    if is_null(method) { return err(get(request, "id"), -32600, "not a JSON-RPC request") }
+    # A notification has no id and must not be answered. `notifications/
+    # initialized` is the one every client sends.
+    if is_null(get(request, "id")) { return null }
+    id = request.id
+
+    if method == "initialize" {
+        return ok(
+            id,
+            {
+                protocolVersion: rpc.PROTOCOL_VERSION,
+                capabilities: advertised(tools, resources, prompts),
+                serverInfo: {
+                    name: default_of(get(info, "name"), "ecko"),
+                    version: default_of(get(info, "version"), "0.1.0"),
+                },
+            },
+        )
+    }
+
+    if method == "tools/list" {
+        # The handler is ours, not the client's business - send only what the
+        # protocol describes, or the reply fails to encode as JSON.
+        listed = map(tools, fn(t) {
+            { name: t.name, description: t.description, inputSchema: t.inputSchema }
+        })
+        return ok(id, { tools: listed })
+    }
+
+    if method == "tools/call" {
+        params = default_of(get(request, "params"), {})
+        name = get(params, "name")
+        found = find_tool(tools, name)
+        if is_null(found) {
+            # An unknown tool is a rejected call, not a failed one.
+            return err(id, -32602, "no such tool: {name}")
+        }
+        args = default_of(get(params, "arguments"), {})
+        # A handler that throws is a crashed tool, not a broken server: report it
+        # as a tool error so the session survives and the model can react.
+        result = try {
+            normalize(found.handler(args))
+        } catch (e) {
+            tool_error("tool '{name}' failed: {e.message}")
+        }
+        return ok(id, result)
+    }
+
+    if method == "resources/list" {
+        listed = map(resources, fn(r) {
+            { uri: r.uri, name: r.name, mimeType: r.mimeType }
+        })
+        return ok(id, { resources: listed })
+    }
+
+    if method == "resources/read" {
+        params = default_of(get(request, "params"), {})
+        uri = get(params, "uri")
+        found = find_by(resources, "uri", uri)
+        if is_null(found) { return err(id, -32602, "no such resource: {uri}") }
+        # A reader that throws is the server's problem, not a tool failure -
+        # there is no `isError` for resources, so it has to be a JSON-RPC error.
+        body = try {
+            found.reader()
+        } catch (e) {
+            return err(id, -32603, "reading {uri}: {e.message}")
+        }
+        return ok(
+            id,
+            { contents: [{ uri: found.uri, mimeType: found.mimeType, text: string(body) }] },
+        )
+    }
+
+    if method == "prompts/list" {
+        listed = map(prompts, fn(p) {
+            { name: p.name, description: p.description, arguments: p.arguments }
+        })
+        return ok(id, { prompts: listed })
+    }
+
+    if method == "prompts/get" {
+        params = default_of(get(request, "params"), {})
+        name = get(params, "name")
+        found = find_by(prompts, "name", name)
+        if is_null(found) { return err(id, -32602, "no such prompt: {name}") }
+        args = default_of(get(params, "arguments"), {})
+        rendered = try {
+            found.renderer(args)
+        } catch (e) {
+            return err(id, -32603, "rendering {name}: {e.message}")
+        }
+        return ok(id, { description: found.description, messages: as_messages(rendered) })
+    }
+
+    err(id, -32601, "method not found: {method}")
+}
+
+## Advertise only the sections this server actually offers. A client branches on
+## this, so claiming `resources` with none declared invites a call that can only
+## answer method-not-found.
+fn advertised(tools, resources, prompts) {
+    mut caps = {}
+    if len(tools) > 0 { caps = insert(caps, "tools", {}) }
+    if len(resources) > 0 { caps = insert(caps, "resources", {}) }
+    if len(prompts) > 0 { caps = insert(caps, "prompts", {}) }
+    caps
+}
+
+## A renderer may answer with a string or a full messages list; a bare string is
+## the common case and becomes one user message.
+fn as_messages(rendered) {
+    if type_of(rendered) == "list" { return rendered }
+    [{ role: "user", content: { type: "text", text: string(rendered) } }]
+}
+
+## Find a declared thing by one of its fields.
+fn find_by(items, field, value) {
+    for i in items {
+        if get(i, field) == value { return i }
+    }
+    null
+}
+
+## Find a declared tool by name, or null.
+export fn find_tool(tools, name) {
+    for t in tools {
+        if t.name == name { return t }
+    }
+    null
+}
+
+## Wrap whatever a handler returned into an MCP result.
+fn normalize(value) {
+    # A list is already content - `text()` returns one, and a handler building
+    # several parts returns one. Wrapping it again would stringify the list.
+    if type_of(value) == "list" { return { content: value } }
+    # A map carrying `content` is a full result, `isError` and all.
+    if type_of(value) == "map" and not is_null(get(value, "content")) { return value }
+    { content: text(value) }
+}
+
+fn ok(id, result) = { jsonrpc: "2.0", id: id, result: result }
+
+fn err(id, code, message) = { jsonrpc: "2.0", id: id, error: { code: code, message: message } }
+
+fn default_of(value, fallback) = if is_null(value) { fallback } else { value }

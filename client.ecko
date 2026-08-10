@@ -4,7 +4,6 @@
 # the server is across a network or a table of canned replies.
 
 import "./jsonrpc.ecko" as rpc
-import "./transport.ecko" as tr
 
 ## Open a session: send `initialize`, then the `notifications/initialized` the
 ## spec requires before any other call.
@@ -25,7 +24,7 @@ export fn connect(transport, info = {}) {
         session,
         "initialize",
         {
-            protocolVersion: tr.PROTOCOL_VERSION,
+            protocolVersion: rpc.PROTOCOL_VERSION,
             capabilities: {},
             clientInfo: { name: name, version: version },
         },

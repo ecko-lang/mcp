@@ -6,6 +6,12 @@
 
 import std.json
 
+## The MCP protocol version this package speaks, in both directions.
+##
+## Shared rather than declared per side: a client and a server that disagree
+## about it fail a handshake, and two constants drift the moment MCP revs.
+export let PROTOCOL_VERSION = "2025-06-18"
+
 ## The error this package raises. `kind` is always "mcp", so a caller can
 ## `catch (e) { if e.kind == "mcp" { ... } }` without matching on message text.
 export fn fail(message, detail = {}) {

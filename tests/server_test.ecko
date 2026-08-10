@@ -1,0 +1,199 @@
+# The server half. `handle` takes a decoded request and a declaration of what
+# this server offers, and returns a reply map - so the whole protocol tests
+# without a pipe or a socket, which is why the transports are thin.
+
+import std.test
+import std.json
+import "../main.ecko"
+srv = main
+
+fn tools() = [
+    srv.tool("wc", "Count words", { type: "object" }, fn(a) len(split(trim(a.text), " "))),
+    srv.tool(
+        "boom",
+        "Always fails",
+        { type: "object" },
+        fn(a) error({ kind: "x", message: "nope" }),
+    ),
+]
+
+fn resources() = [
+    srv.resource("memo://readme", "readme", "text/plain", fn() "the body"),
+    srv.resource("memo://bad", "bad", "text/plain", fn() error({ kind: "x", message: "gone" })),
+]
+
+fn prompts() = [srv.prompt("review", "Review some code", [], fn(a) "review this: {a.code}")]
+
+fn everything() = { tools: tools(), resources: resources(), prompts: prompts() }
+
+fn mcp_session() {
+    offered = everything()
+    transport = srv.fake(fn(request) {
+        reply = srv.handle(request, offered, { name: "loopback" })
+        if is_null(reply) { { jsonrpc: "2.0", id: null, result: {} } } else { reply }
+    })
+    srv.connect(transport)
+}
+
+fn req(id, method, params = {}) = { jsonrpc: "2.0", id: id, method: method, params: params }
+
+# ------------------------------------------------------------------ handshake
+
+test.case("initialize answers with the shared protocol version", fn() {
+    # One constant for both directions: a client and a server that disagree
+    # fail a handshake, and two declarations drift the moment MCP revs.
+    r = srv.handle(req(1, "initialize"), tools(), { name: "demo", version: "2.0" })
+    test.eq(r.result.protocolVersion, srv.PROTOCOL_VERSION)
+    test.eq(r.result.serverInfo.name, "demo")
+})
+
+test.case("capabilities advertise only what is actually offered", fn() {
+    # A client branches on this, so claiming a section with nothing in it
+    # invites a call that can only answer method-not-found.
+    only_tools = srv.handle(req(1, "initialize"), tools()).result.capabilities
+    test.ok(not is_null(get(only_tools, "tools")), "tools advertised")
+    test.ok(is_null(get(only_tools, "resources")), "resources not advertised")
+
+    all = srv.handle(req(1, "initialize"), everything()).result.capabilities
+    test.eq(len(sort(keys(all))), 3)
+})
+
+test.case("a bare list of tools is accepted as the whole offer", fn() {
+    r = srv.handle(req(2, "tools/list"), tools())
+    test.eq(len(r.result.tools), 2)
+})
+
+test.case("a notification gets no reply at all", fn() {
+    # On stdio a spurious reply desynchronises a client reading line by line.
+    r = srv.handle({ jsonrpc: "2.0", method: "notifications/initialized" }, tools())
+    test.ok(is_null(r), "no reply for a notification")
+})
+
+# ---------------------------------------------------------------------- tools
+
+test.case("tools/list returns the description and schema, never the handler", fn() {
+    # The handler is an Ecko function: it would not encode as JSON, and it is
+    # none of the client's business.
+    r = srv.handle(req(2, "tools/list"), tools())
+    test.eq(r.result.tools[0].name, "wc")
+    test.ok(is_null(get(r.result.tools[0], "handler")), "handler is not in the reply")
+})
+
+test.case("tools/call runs the handler and wraps the result as content", fn() {
+    r = srv.handle(req(3, "tools/call", { name: "wc", arguments: { text: "a b c" } }), tools())
+    test.eq(r.result.content[0].text, "3")
+})
+
+test.case("a handler returning a content list is passed through unwrapped", fn() {
+    t = [srv.tool("two", "", {}, fn(a) srv.text("x"))]
+    r = srv.handle(req(1, "tools/call", { name: "two", arguments: {} }), t)
+    test.eq(r.result.content[0].text, "x")
+})
+
+test.case("a crashed handler becomes a tool error, not a dead server", fn() {
+    # The call succeeded and the tool failed. MCP models that as data so a model
+    # can read why and try again, and the session survives.
+    r = srv.handle(req(4, "tools/call", { name: "boom", arguments: {} }), tools())
+    test.ok(is_null(get(r, "error")), "not a JSON-RPC error")
+    test.ok(r.result.isError, "flagged as a tool error")
+    test.ok(contains(r.result.content[0].text, "nope"), "carries the handler's message")
+})
+
+test.case("an unknown tool is a JSON-RPC error, not a tool error", fn() {
+    # Reporting it as isError would tell the model its arguments were wrong.
+    r = srv.handle(req(5, "tools/call", { name: "absent" }), tools())
+    test.eq(r.error.code, -32602)
+})
+
+# ------------------------------------------------------------------ resources
+
+test.case("resources/list returns uri, name and type but not the reader", fn() {
+    r = srv.handle(req(1, "resources/list"), everything())
+    test.eq(r.result.resources[0].uri, "memo://readme")
+    test.ok(is_null(get(r.result.resources[0], "reader")), "reader is not in the reply")
+})
+
+test.case("resources/read runs the reader lazily", fn() {
+    r = srv.handle(req(2, "resources/read", { uri: "memo://readme" }), everything())
+    test.eq(r.result.contents[0].text, "the body")
+    test.eq(r.result.contents[0].mimeType, "text/plain")
+})
+
+test.case("an unknown resource is refused", fn() {
+    r = srv.handle(req(3, "resources/read", { uri: "memo://nope" }), everything())
+    test.eq(r.error.code, -32602)
+})
+
+test.case("a reader that throws is a JSON-RPC error, not a tool error", fn() {
+    # There is no isError for resources, so a failed read has to be an error.
+    r = srv.handle(req(4, "resources/read", { uri: "memo://bad" }), everything())
+    test.eq(r.error.code, -32603)
+    test.ok(contains(r.error.message, "gone"), "carries the reader's message")
+})
+
+# -------------------------------------------------------------------- prompts
+
+test.case("prompts/list returns the declarations", fn() {
+    r = srv.handle(req(1, "prompts/list"), everything())
+    test.eq(r.result.prompts[0].name, "review")
+})
+
+test.case("prompts/get renders a string into one user message", fn() {
+    r = srv.handle(
+        req(2, "prompts/get", { name: "review", arguments: { code: "x = 1" } }),
+        everything(),
+    )
+    test.eq(r.result.messages[0].role, "user")
+    test.ok(
+        contains(r.result.messages[0].content.text, "x = 1"),
+        "the argument reached the renderer",
+    )
+})
+
+test.case("an unknown prompt is refused", fn() {
+    r = srv.handle(req(3, "prompts/get", { name: "absent" }), everything())
+    test.eq(r.error.code, -32602)
+})
+
+test.case("a section that was not offered answers method-not-found", fn() {
+    r = srv.handle(req(1, "resources/list"), tools())
+    test.eq(len(r.result.resources), 0)
+})
+
+# ------------------------------------------------------------------- the wire
+
+test.case("handle_text decodes, answers and re-encodes", fn() {
+    out = srv.handle_text(json.encode(req(1, "initialize")), tools())
+    test.eq(json.decode(out).result.protocolVersion, srv.PROTOCOL_VERSION)
+})
+
+test.case("handle_text returns null for a notification", fn() {
+    out = srv.handle_text(
+        json.encode({ jsonrpc: "2.0", method: "notifications/initialized" }),
+        tools(),
+    )
+    test.ok(is_null(out), "nothing to write")
+})
+
+test.case("malformed JSON is answered with a parse error, not thrown", fn() {
+    # A client sending garbage gets -32700 back rather than taking the server
+    # down with it.
+    out = srv.handle_text("not json at all", tools())
+    test.eq(json.decode(out).error.code, -32700)
+})
+
+test.case("an unknown method is method-not-found", fn() {
+    r = srv.handle(req(6, "completion/complete"), everything())
+    test.eq(r.error.code, -32601)
+})
+
+# ---------------------------------------------------- the two halves together
+
+test.case("the client can read what the server writes", fn() {
+    # The point of one package: the same jsonrpc.ecko frames both sides, so a
+    # round trip through it is the strongest check that they agree.
+    session = mcp_session()
+    test.eq(srv.server_version(session), srv.PROTOCOL_VERSION)
+    test.eq(map(srv.tools(session), fn(t) t.name), ["wc", "boom"])
+    test.eq(srv.text_of(srv.call_tool(session, "wc", { text: "one two" })), "2")
+})
