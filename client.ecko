@@ -68,10 +68,7 @@ export fn close(session) = session.transport.close()
 # ---------------------------------------------------------------------- tools
 
 ## The tools the server offers: `[{ name, description, inputSchema }]`.
-export fn tools(session) {
-    r = call(session, "tools/list", {})
-    list_field(r, "tools")
-}
+export fn tools(session) = paged(session, "tools/list", "tools")
 
 ## Call a tool by name. `args` is the argument map its `inputSchema` describes.
 ##
@@ -109,10 +106,7 @@ export fn is_error(result) = get(result, "isError") == true
 # ------------------------------------------------------------------ resources
 
 ## The resources the server exposes: `[{ uri, name, mimeType }]`.
-export fn resources(session) {
-    r = call(session, "resources/list", {})
-    list_field(r, "resources")
-}
+export fn resources(session) = paged(session, "resources/list", "resources")
 
 ## Read one resource by URI. Returns `[{ uri, mimeType, text }]`.
 export fn read_resource(session, uri) {
@@ -123,10 +117,7 @@ export fn read_resource(session, uri) {
 # -------------------------------------------------------------------- prompts
 
 ## The prompt templates the server offers: `[{ name, description, arguments }]`.
-export fn prompts(session) {
-    r = call(session, "prompts/list", {})
-    list_field(r, "prompts")
-}
+export fn prompts(session) = paged(session, "prompts/list", "prompts")
 
 ## Render a prompt template. Returns the server's `messages` list.
 export fn get_prompt(session, name, args = {}) {
@@ -135,6 +126,41 @@ export fn get_prompt(session, name, args = {}) {
 }
 
 # ---------------------------------------------------------------------- shared
+
+## Follow a cursor to the end of a paginated list.
+##
+## MCP paginates `*/list`: a reply may carry `nextCursor`, and the rest only
+## arrives if you ask for it. Reading the first page and stopping is the worst
+## kind of bug - a server with more tools than fit one page returns a short list
+## and nothing says it was truncated, so a model is simply never told about the
+## rest.
+##
+## `MAX_PAGES` bounds it: a server that returns the same cursor forever would
+## otherwise loop until the process dies.
+fn paged(session, method, field) {
+    mut out = []
+    mut cursor = null
+    mut seen = []
+    mut page = 0
+    loop {
+        params = if is_null(cursor) { {} } else { { cursor: cursor } }
+        r = call(session, method, params)
+        out = out + list_field(r, field)
+        cursor = get(r, "nextCursor")
+        if is_null(cursor) { return out }
+        # A repeated cursor means the server is not advancing. Stop rather than
+        # spin, and say so - silently returning a partial list is what this
+        # whole function exists to avoid.
+        if contains(seen, cursor) { rpc.fail("server repeated pagination cursor for {method}") }
+        seen = push(seen, cursor)
+        page = page + 1
+        if page >= MAX_PAGES { rpc.fail("{method} exceeded {MAX_PAGES} pages") }
+    }
+}
+
+## How many pages of a `*/list` to follow before giving up on a server that
+## never stops paginating.
+export let MAX_PAGES = 1000
 
 ## Read a list-valued field, treating a missing one as empty.
 ##
@@ -146,3 +172,61 @@ fn list_field(result, name) {
     if type_of(v) != "list" { rpc.fail("server sent a non-list '{name}'") }
     v
 }
+
+## The server's tools as specs `ai ... using` can take.
+##
+##   session = mcp.connect(mcp.http_transport(url))
+##   answer = ai "what changed in the changelog?" using mcp.as_tools(session)
+##
+## This is the point of the package: the model picks a tool, Ecko calls it over
+## MCP, and the result goes back into the conversation. Without it a caller has
+## to wire each tool up by hand.
+##
+## The parameter names come from the tool's own `inputSchema`, so the model is
+## told what the server says it accepts.
+export fn as_tools(session) {
+    map(tools(session), fn(t) as_tool(session, t))
+}
+
+## One declared tool as a spec. Useful when a server offers fifty and the
+## program should only expose three.
+## The `call` closure holds the session, so invoking the tool is a round trip to
+## the server rather than anything local.
+export fn as_tool(session, t) {
+    desc = get(t, "description")
+    {
+        name: t.name,
+        description: if is_null(desc) { t.name } else { desc },
+        params: schema_params(get(t, "inputSchema")),
+        call: fn(args) text_of(call_tool(session, t.name, args)),
+    }
+}
+
+## The argument names a JSON Schema declares, in a stable order.
+##
+## Sorted because Ecko maps are unordered: leaving it to iteration order would
+## give the model a different signature run to run.
+export fn schema_params(schema) {
+    if type_of(schema) != "map" { return [] }
+    props = get(schema, "properties")
+    if type_of(props) != "map" { return [] }
+    sort(keys(props))
+}
+
+## Tell the server to stop working on a request.
+##
+## MCP models cancellation as a notification, not a request: there is nothing to
+## wait for and no acknowledgement. The server may already have finished, in
+## which case it ignores this - which is why a caller must not treat sending it
+## as proof the work stopped.
+export fn cancel(session, request_id, reason = "") {
+    params = { requestId: request_id }
+    params = if reason == "" { params } else { insert(params, "reason", reason) }
+    notify(session, "notifications/cancelled", params)
+}
+
+## The id the next `call` on this session will use.
+##
+## Needed to cancel: the id has to be known before the request is sent, and
+## `call` allocates it internally.
+export fn next_request_id(session) = cell_get(session.next_id)

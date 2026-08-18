@@ -7,6 +7,8 @@
 # can write to a child's stdin.
 
 import std.http
+import std.proc
+import std.json
 import "./jsonrpc.ecko" as rpc
 
 ## An HTTP transport, MCP's "Streamable HTTP" shape: every request is a POST of
@@ -59,4 +61,45 @@ export fn fake(handler) {
         request = json_decode(text)
         json_encode(handler(request))
     }, close: fn() null }
+}
+
+## A stdio transport: spawn the server and talk to it over its pipes.
+##
+##   session = mcp.connect(mcp.stdio_transport("npx", ["-y", "@modelcontextprotocol/server-everything"]))
+##
+## This is how almost every MCP server ships - the client starts the process and
+## uses the pipes it already has, so there is no port, no URL and nothing to
+## authenticate. `opts` takes `timeout_ms` (default 30000) for how long to wait
+## on a reply.
+##
+## Needs the **exec** capability to start the process. Nothing here touches the
+## network.
+export fn stdio_transport(command, args = [], opts = {}) {
+    timeout = get(opts, "timeout_ms")
+    timeout = if is_null(timeout) { 30000 } else { timeout }
+    child = proc.spawn(command, args)
+    { kind: "stdio", url: command, process: child, send: fn(text) {
+        # One message per line, which is what the framing requires.
+        proc.write(child, text + "\n")
+        # A notification has no id and gets no reply. Reading anyway would
+        # block until the timeout and then steal the *next* response, which
+        # desynchronises every call after it.
+        if expects_reply(text) {
+            line = proc.read_line(child, timeout)
+            if is_null(line) { rpc.fail("no reply from '{command}' within {timeout}ms") }
+            line
+        } else { "" }
+    }, close: fn() {
+        proc.close_stdin(child)
+        proc.kill(child)
+    } }
+}
+
+## Whether an outgoing message is a request rather than a notification.
+##
+## Decided from the wire text because that is what the transport has: a request
+## carries an id, a notification does not.
+export fn expects_reply(text) {
+    decoded = try { json.decode(text) } catch (e) { return true }
+    type_of(decoded) == "map" and not is_null(get(decoded, "id"))
 }

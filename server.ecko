@@ -94,12 +94,14 @@ export fn handle(request, offer, info = {}) {
     }
 
     if method == "tools/list" {
+        params = default_of(get(request, "params"), {})
+        window = page_of(tools, get(params, "cursor"))
         # The handler is ours, not the client's business - send only what the
         # protocol describes, or the reply fails to encode as JSON.
-        listed = map(tools, fn(t) {
+        listed = map(window.items, fn(t) {
             { name: t.name, description: t.description, inputSchema: t.inputSchema }
         })
-        return ok(id, { tools: listed })
+        return ok(id, with_cursor({ tools: listed }, window))
     }
 
     if method == "tools/call" {
@@ -122,10 +124,12 @@ export fn handle(request, offer, info = {}) {
     }
 
     if method == "resources/list" {
-        listed = map(resources, fn(r) {
+        params = default_of(get(request, "params"), {})
+        window = page_of(resources, get(params, "cursor"))
+        listed = map(window.items, fn(r) {
             { uri: r.uri, name: r.name, mimeType: r.mimeType }
         })
-        return ok(id, { resources: listed })
+        return ok(id, with_cursor({ resources: listed }, window))
     }
 
     if method == "resources/read" {
@@ -147,10 +151,12 @@ export fn handle(request, offer, info = {}) {
     }
 
     if method == "prompts/list" {
-        listed = map(prompts, fn(p) {
+        params = default_of(get(request, "params"), {})
+        window = page_of(prompts, get(params, "cursor"))
+        listed = map(window.items, fn(p) {
             { name: p.name, description: p.description, arguments: p.arguments }
         })
-        return ok(id, { prompts: listed })
+        return ok(id, with_cursor({ prompts: listed }, window))
     }
 
     if method == "prompts/get" {
@@ -168,6 +174,30 @@ export fn handle(request, offer, info = {}) {
     }
 
     err(id, -32601, "method not found: {method}")
+}
+
+## How many entries one `*/list` page carries.
+##
+## MCP leaves the size to the server. Small enough that pagination is exercised
+## rather than theoretical, large enough that an ordinary server sends one page.
+export let PAGE_SIZE = 100
+
+## One page of a list, and whether more follows.
+##
+## The cursor is the index of the next item, as a string - opaque to the client
+## by design, so it can change shape later without breaking one.
+fn page_of(items, cursor) {
+    start = if is_null(cursor) { 0 } else { int(cursor) }
+    if start < 0 or start > len(items) { rpc.fail("bad pagination cursor: {cursor}") }
+    stop = if start + PAGE_SIZE > len(items) { len(items) } else { start + PAGE_SIZE }
+    { items: items[start..stop], next: if stop < len(items) { string(stop) } else { null } }
+}
+
+## Attach `nextCursor` when there is another page, and not otherwise. A cursor
+## that is always present would make a client loop forever.
+fn with_cursor(result, window) {
+    if is_null(window.next) { return result }
+    insert(result, "nextCursor", window.next)
 }
 
 ## Advertise only the sections this server actually offers. A client branches on
@@ -219,3 +249,48 @@ fn ok(id, result) = { jsonrpc: "2.0", id: id, result: result }
 fn err(id, code, message) = { jsonrpc: "2.0", id: id, error: { code: code, message: message } }
 
 fn default_of(value, fallback) = if is_null(value) { fallback } else { value }
+
+## Report progress on a long-running request.
+##
+## `token` is the `progressToken` the client sent in the request's `_meta`;
+## without one the client did not ask for progress and this returns null rather
+## than sending a notification nobody is listening for.
+export fn progress(token, done, total = null) {
+    if is_null(token) { return null }
+    params = { progressToken: token, progress: done }
+    params = if is_null(total) { params } else { insert(params, "total", total) }
+    { jsonrpc: "2.0", method: "notifications/progress", params: params }
+}
+
+## The progress token a request carries, or null if the client did not ask.
+export fn progress_token(request) {
+    params = get(request, "params")
+    if type_of(params) != "map" { return null }
+    meta = get(params, "_meta")
+    if type_of(meta) != "map" { return null }
+    get(meta, "progressToken")
+}
+
+## Announce that the tool list changed, so a client can re-read it.
+##
+## A session holds whatever `tools/list` returned when it connected; without
+## this a server that gains or loses a tool is talking to a stale client.
+export fn tools_changed() = {
+    jsonrpc: "2.0",
+    method: "notifications/tools/list_changed",
+    params: {},
+}
+
+## The same for resources and prompts.
+export fn resources_changed() = {
+    jsonrpc: "2.0",
+    method: "notifications/resources/list_changed",
+    params: {},
+}
+
+## The same, for the prompt list.
+export fn prompts_changed() = {
+    jsonrpc: "2.0",
+    method: "notifications/prompts/list_changed",
+    params: {},
+}

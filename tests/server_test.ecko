@@ -197,3 +197,152 @@ test.case("the client can read what the server writes", fn() {
     test.eq(map(srv.tools(session), fn(t) t.name), ["wc", "boom"])
     test.eq(srv.text_of(srv.call_tool(session, "wc", { text: "one two" })), "2")
 })
+
+# ----------------------------------------------------------------- pagination
+
+## A server with more tools than fit one page.
+fn many_tools(n) {
+    mut out = []
+    mut i = 0
+    while i < n {
+        out = push(out, srv.tool("t{i}", "tool {i}", { type: "object" }, fn(a) i))
+        i = i + 1
+    }
+    out
+}
+
+test.case("a list longer than a page reports a next cursor", fn() {
+    r = srv.handle(req(1, "tools/list"), many_tools(srv.PAGE_SIZE + 5))
+    test.eq(len(r.result.tools), srv.PAGE_SIZE)
+    test.ok(not is_null(get(r.result, "nextCursor")), "nextCursor is set")
+})
+
+test.case("the last page has no cursor", fn() {
+    paged = many_tools(srv.PAGE_SIZE + 5)
+    first = srv.handle(req(1, "tools/list"), paged)
+    last = srv.handle(req(2, "tools/list", { cursor: first.result.nextCursor }), paged)
+    test.eq(len(last.result.tools), 5)
+    test.ok(is_null(get(last.result, "nextCursor")), "no cursor on the last page")
+})
+
+test.case("a list that fits one page carries no cursor", fn() {
+    # A cursor that is always present would make a client loop forever.
+    r = srv.handle(req(1, "tools/list"), many_tools(3))
+    test.ok(is_null(get(r.result, "nextCursor")), "no cursor when it all fits")
+})
+
+test.case("a bad cursor is refused rather than silently clamped", fn() {
+    caught = try {
+        srv.handle(req(1, "tools/list", { cursor: "99999" }), many_tools(3))
+        "no error"
+    } catch (e) { e.message }
+    test.ok(contains(caught, "cursor"), "names the problem: {caught}")
+})
+
+test.case("the client follows cursors to the end of the list", fn() {
+    # The bug this exists for: reading page one and stopping returns a short
+    # list with nothing indicating it was truncated, so a model is never told
+    # about the rest.
+    offered = many_tools(srv.PAGE_SIZE + 42)
+    session = srv.connect(srv.fake(fn(request) {
+        r = srv.handle(request, offered, { name: "paged" })
+        if is_null(r) { { jsonrpc: "2.0", id: null, result: {} } } else { r }
+    }))
+    test.eq(len(srv.tools(session)), srv.PAGE_SIZE + 42)
+})
+
+test.case("a server that repeats a cursor is stopped, not looped on", fn() {
+    stuck = srv.fake(fn(request) {
+        id = get(request, "id")
+        if request.method == "initialize" {
+            return { jsonrpc: "2.0", id: id, result: { protocolVersion: srv.PROTOCOL_VERSION } }
+        }
+        # Always the same cursor: a client that trusts it never terminates.
+        { jsonrpc: "2.0", id: id, result: { tools: [], nextCursor: "same" } }
+    })
+    session = srv.connect(stuck)
+    caught = try {
+        srv.tools(session)
+        "no error"
+    } catch (e) { e.message }
+    test.ok(contains(caught, "repeated"), "names the problem: {caught}")
+})
+
+# ------------------------------------------ cancellation, progress, staleness
+
+test.case("cancel sends a notification, not a request", fn() {
+    # There is nothing to wait for and no acknowledgement; an id here would make
+    # the server try to reply to a cancellation.
+    seen = cell([])
+    session = srv.connect(srv.fake(fn(request) {
+        cell_update(seen, fn(v) push(v, request))
+        r = srv.handle(request, tools(), { name: "t" })
+        if is_null(r) { { jsonrpc: "2.0", id: null, result: {} } } else { r }
+    }))
+    srv.cancel(session, 7, "user pressed stop")
+    sent = cell_get(seen)
+    last = sent[len(sent) - 1]
+    test.eq(last.method, "notifications/cancelled")
+    test.ok(is_null(get(last, "id")), "no id on a cancellation")
+    test.eq(last.params.requestId, 7)
+})
+
+test.case("the id a call will use is knowable before sending it", fn() {
+    # Cancelling needs the id up front, and `call` allocates it internally.
+    seen = cell([])
+    session = srv.connect(srv.fake(fn(request) {
+        cell_update(seen, fn(v) push(v, request))
+        r = srv.handle(request, tools(), { name: "t" })
+        if is_null(r) { { jsonrpc: "2.0", id: null, result: {} } } else { r }
+    }))
+    expected = srv.next_request_id(session)
+    srv.call(session, "tools/list")
+    sent = cell_get(seen)
+    test.eq(sent[len(sent) - 1].id, expected)
+})
+
+test.case("progress is skipped when the client did not ask for it", fn() {
+    # No progressToken means nobody is listening; sending anyway is noise.
+    test.ok(is_null(srv.progress(null, 1, 10)), "no token, no notification")
+    p = srv.progress("tok", 3, 10)
+    test.eq(p.method, "notifications/progress")
+    test.eq(p.params.progress, 3)
+    test.eq(p.params.total, 10)
+})
+
+test.case("progress_token reads the token out of a request", fn() {
+    r = req(1, "tools/call", { name: "x" })
+    test.ok(is_null(srv.progress_token(r)), "absent when not sent")
+    with_token = {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: { name: "x", _meta: { progressToken: "abc" } },
+    }
+    test.eq(srv.progress_token(with_token), "abc")
+})
+
+test.case("list-changed notifications carry no id", fn() {
+    for n in [srv.tools_changed(), srv.resources_changed(), srv.prompts_changed()] {
+        test.ok(is_null(get(n, "id")), "a notification has no id")
+        test.ok(contains(n.method, "list_changed"), "names the change")
+    }
+})
+
+# ------------------------------------------------------ the stdio transport
+
+test.case("a request expects a reply and a notification does not", fn() {
+    # The whole reason stdio needs this distinction: reading after a
+    # notification blocks until the timeout and then steals the *next*
+    # response, which desynchronises every call after it.
+    request = json.encode({ jsonrpc: "2.0", id: 1, method: "tools/list" })
+    note = json.encode({ jsonrpc: "2.0", method: "notifications/initialized" })
+    test.ok(srv.expects_reply(request), "a request expects a reply")
+    test.ok(not srv.expects_reply(note), "a notification does not")
+})
+
+test.case("unparseable outgoing text is assumed to expect a reply", fn() {
+    # Guessing wrong in this direction times out; guessing wrong the other way
+    # silently misaligns every later call, which is far worse.
+    test.ok(srv.expects_reply("not json"), "unknown text is treated as a request")
+})
