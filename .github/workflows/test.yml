@@ -1,0 +1,88 @@
+name: Test
+
+# Runs the package's own gates against the released Ecko toolchain, in a clean
+# checkout with no sibling repositories on disk.
+#
+# Two failure modes this exists to catch, both of which have shipped before:
+#
+#   1. A file that only resolves on the author's machine. `mime` published an
+#      archive importing ../smtp-client/main.ecko; it passed locally because the
+#      sibling repo was there, and failed for everyone else. A checkout of this
+#      repo alone cannot resolve a sibling, so the import fails here instead.
+#
+#   2. The toolchain moving under a package that nobody touched. The 0.13.0
+#      formatter reflowed long if/else chains, which silently invalidated four
+#      packages that had not changed in months. Nothing pushes those repos, so
+#      only the schedule below finds it.
+#
+# The release workflow runs a narrower version of these checks on `*.ecko` at
+# the repository root. This one is recursive, so tests/ and demo/ are covered.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Weekly. The point is drift: a package can go red without a single commit
+    # when a new Ecko release changes the formatter or a check.
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Packages are Ecko source, so the toolchain is the released binary,
+      # deliberately `latest` rather than pinned: the question this workflow
+      # answers is whether the package works with what users actually install.
+      - name: Install Ecko
+        run: |
+          curl -fSL --retry 3 --retry-delay 2 \
+            https://ecko.sh/dl/latest/ecko-x86_64-linux.tar.gz -o /tmp/ecko.tar.gz
+          mkdir -p /tmp/ecko-extract
+          tar -xzf /tmp/ecko.tar.gz -C /tmp/ecko-extract
+          bin="$(find /tmp/ecko-extract -type f -name ecko | head -1)"
+          test -n "$bin" || { echo "::error::archive has no 'ecko' binary"; exit 1; }
+          sudo install -m 0755 "$bin" /usr/local/bin/ecko
+          ecko --version
+
+      # vendor/ is fetched third-party source and is not ours to format.
+      - name: Collect sources
+        run: |
+          find . -name '*.ecko' -not -path './vendor/*' -print0 > /tmp/sources
+          count=$(tr -dc '\0' < /tmp/sources | wc -c)
+          test "$count" != "0" || { echo "::error::no .ecko sources found"; exit 1; }
+          echo "checking $count file(s)"
+
+      - name: The manifest is valid JSON
+        run: |
+          # `ecko fmt` rewrites a file it is handed into Ecko map syntax, which
+          # is not JSON. Pointing it at ecko.json by accident produces a manifest
+          # that parses nowhere, breaking every `import` of this package.
+          jq -e . ecko.json > /dev/null || {
+            echo "::error::ecko.json is not valid JSON"; exit 1; }
+
+      - name: Formatting
+        run: xargs -0 -a /tmp/sources ecko fmt --check
+
+      - name: Static checks
+        run: xargs -0 -a /tmp/sources ecko check
+
+      - name: Tests
+        run: ecko test
+
+      # Every export should carry a `##` doc comment. The generated reference is
+      # part of the package's surface, and a hole in it ships to every reader.
+      - name: Documented exports
+        run: |
+          undocumented=$(ecko doc main.ecko | grep -c 'Undocumented' || true)
+          if [ "$undocumented" != "0" ]; then
+            echo "::error::$undocumented export(s) have no ## doc comment"
+            ecko doc main.ecko | grep -B2 'Undocumented' | grep '^## `' || true
+            exit 1
+          fi

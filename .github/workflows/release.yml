@@ -47,8 +47,11 @@ jobs:
       # unpublished one: it goes out under a version number people will pin.
       - name: Check and test
         run: |
-          ecko fmt --check *.ecko
-          ecko check *.ecko
+          # Recursive: tests/ and demo/ are sources too, and a non-recursive
+          # glob let four packages drift out of format unnoticed.
+          find . -name '*.ecko' -not -path './vendor/*' -print0 > /tmp/sources
+          xargs -0 -a /tmp/sources ecko fmt --check
+          xargs -0 -a /tmp/sources ecko check
           ecko test
 
       # Every export should carry a `##` doc comment. The generated reference is
