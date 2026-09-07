@@ -3,11 +3,12 @@
 # A transport is just a map with a `send` function taking wire text and
 # returning wire text. Keeping it a value rather than a hardcoded call is what
 # lets the protocol layer be tested without a server - `fake()` below is the
-# whole test harness - and is where a stdio transport plugs in when `std.proc`
-# can write to a child's stdin.
+# whole test harness - and is where the stdio transport plugs in, driving the
+# child's pipes as streams through `std.io`.
 
 import std.http
 import std.proc
+import std.io
 import std.json
 import "./jsonrpc.ecko" as rpc
 
@@ -78,19 +79,29 @@ export fn stdio_transport(command, args = [], opts = {}) {
     timeout = get(opts, "timeout_ms")
     timeout = if is_null(timeout) { 30000 } else { timeout }
     child = proc.spawn(command, args)
+    # The child's pipes are streams. The deadline is set once, on the stream
+    # rather than per read, and a read past it raises instead of answering
+    # null - which is what finally separates "the server is slow" from "the
+    # server is gone". `proc.stdout` hands back the same stream every call, so
+    # a line buffered by one read is still there for the next.
+    out = io.timeout(proc.stdout(child), timeout)
     { kind: "stdio", url: command, process: child, send: fn(text) {
         # One message per line, which is what the framing requires.
-        proc.write(child, text + "\n")
+        io.write(proc.stdin(child), text + "\n")
         # A notification has no id and gets no reply. Reading anyway would
         # block until the timeout and then steal the *next* response, which
         # desynchronises every call after it.
         if expects_reply(text) {
-            line = proc.read_line(child, timeout)
-            if is_null(line) { rpc.fail("no reply from '{command}' within {timeout}ms") }
+            line = try {
+                io.read_line(out)
+            } catch (e) {
+                rpc.fail("no reply from '{command}' within {timeout}ms")
+            }
+            if is_null(line) { rpc.fail("'{command}' closed its output without replying") }
             line
         } else { "" }
     }, close: fn() {
-        proc.close_stdin(child)
+        io.close(proc.stdin(child))
         proc.kill(child)
     } }
 }
