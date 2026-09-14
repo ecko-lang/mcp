@@ -206,7 +206,7 @@ export fn as_tool(session, t) {
 ##
 ## Sorted because Ecko maps are unordered: leaving it to iteration order would
 ## give the model a different signature run to run.
-export fn schema_params(schema) {
+fn schema_params(schema) {
     if type_of(schema) != "map" { return [] }
     props = get(schema, "properties")
     if type_of(props) != "map" { return [] }

@@ -5,6 +5,7 @@
 import std.test
 import std.json
 import "../main.ecko"
+import "../transport.ecko"
 srv = main
 
 fn tools() = [
@@ -28,7 +29,7 @@ fn everything() = { tools: tools(), resources: resources(), prompts: prompts() }
 
 fn mcp_session() {
     offered = everything()
-    transport = srv.fake(fn(request) {
+    let transport = srv.fake(fn(request) {
         reply = srv.handle(request, offered, { name: "loopback" })
         if is_null(reply) { { jsonrpc: "2.0", id: null, result: {} } } else { reply }
     })
@@ -337,12 +338,12 @@ test.case("a request expects a reply and a notification does not", fn() {
     # response, which desynchronises every call after it.
     request = json.encode({ jsonrpc: "2.0", id: 1, method: "tools/list" })
     note = json.encode({ jsonrpc: "2.0", method: "notifications/initialized" })
-    test.ok(srv.expects_reply(request), "a request expects a reply")
-    test.ok(not srv.expects_reply(note), "a notification does not")
+    test.ok(transport.expects_reply(request), "a request expects a reply")
+    test.ok(not transport.expects_reply(note), "a notification does not")
 })
 
 test.case("unparseable outgoing text is assumed to expect a reply", fn() {
     # Guessing wrong in this direction times out; guessing wrong the other way
     # silently misaligns every later call, which is far worse.
-    test.ok(srv.expects_reply("not json"), "unknown text is treated as a request")
+    test.ok(transport.expects_reply("not json"), "unknown text is treated as a request")
 })

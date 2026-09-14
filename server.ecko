@@ -227,7 +227,7 @@ fn find_by(items, field, value) {
 }
 
 ## Find a declared tool by name, or null.
-export fn find_tool(tools, name) {
+fn find_tool(tools, name) {
     for t in tools {
         if t.name == name { return t }
     }

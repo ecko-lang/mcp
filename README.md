@@ -106,6 +106,14 @@ capability at all.
 `offer` is `{ tools, resources, prompts }`, each optional. A bare list is taken
 as the tools.
 
+### Constants
+
+| name | what it is |
+|---|---|
+| `mcp.PROTOCOL_VERSION` | The MCP revision this package speaks, shared by both sides so a handshake cannot disagree with itself. |
+| `mcp.PAGE_SIZE` | How many entries a served `*/list` returns per page. |
+| `mcp.MAX_PAGES` | How many pages of a `*/list` the client follows before giving up on a server that never stops paginating. |
+
 ## Two kinds of failure, and they are different
 
 - **A JSON-RPC error** means the call was rejected: no such tool, bad argument,

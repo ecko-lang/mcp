@@ -12,8 +12,12 @@
 #
 # Needs the **net** capability for the HTTP transport, and none for a fake one.
 
-export * from "./jsonrpc.ecko"
-export * from "./transport.ecko"
+# Selective on purpose. `fail`, `result_of`, `reply_for`, `is_notification`,
+# `body_text` and `expects_reply` stay exported by their own files so sibling
+# modules and the tests can reach them, but they are wire-protocol plumbing
+# rather than API - a blanket `export *` would publish all six as `mcp.*`.
+export { PROTOCOL_VERSION, request, notification, encode } from "./jsonrpc.ecko"
+export { http_transport, fake, stdio_transport } from "./transport.ecko"
 export * from "./client.ecko"
 export * from "./server.ecko"
 export * from "./serve.ecko"

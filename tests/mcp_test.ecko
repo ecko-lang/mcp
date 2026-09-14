@@ -5,6 +5,8 @@
 import std.test
 import std.json
 import "../main.ecko"
+import "../jsonrpc.ecko"
+import "../transport.ecko"
 mcp = main
 
 ## A server that answers from a table, and records what it was asked.
@@ -204,7 +206,7 @@ test.case("an error carries kind mcp so a caller can match on it", fn() {
 test.case("a reply whose id does not match the request is refused", fn() {
     # The check that stops one call's result being attributed to another.
     caught = try {
-        mcp.reply_for(1, json.encode({ jsonrpc: "2.0", id: 99, result: 1 }))
+        jsonrpc.reply_for(1, json.encode({ jsonrpc: "2.0", id: 99, result: 1 }))
         ""
     } catch (e) { e.message }
     test.ok(contains(caught, "does not match"), "contains(caught, 'does not match')")
@@ -212,7 +214,7 @@ test.case("a reply whose id does not match the request is refused", fn() {
 
 test.case("a reply with neither result nor error is refused", fn() {
     caught = try {
-        mcp.result_of({ jsonrpc: "2.0", id: 1 })
+        jsonrpc.result_of({ jsonrpc: "2.0", id: 1 })
         ""
     } catch (e) { e.message }
     test.ok(
@@ -235,10 +237,10 @@ test.case("a notification has a method and no id", fn() {
     n = mcp.notification("notifications/cancelled")
     test.ok(n.method == "notifications/cancelled", "n.method == 'notifications/cancelled'")
     test.ok(is_null(get(n, "id")), "is_null(get(n, 'id'))")
-    test.ok(mcp.is_notification(n), "mcp.is_notification(n)")
+    test.ok(jsonrpc.is_notification(n), "jsonrpc.is_notification(n)")
     test.ok(
-        not mcp.is_notification(mcp.request(1, "x")),
-        "not mcp.is_notification(mcp.request(1, 'x'))",
+        not jsonrpc.is_notification(mcp.request(1, "x")),
+        "not jsonrpc.is_notification(mcp.request(1, 'x'))",
     )
 })
 
@@ -247,19 +249,19 @@ test.case("a notification has a method and no id", fn() {
 test.case("an SSE data frame is unwrapped to its JSON", fn() {
     body = "event: message\ndata: " + json.encode({ jsonrpc: "2.0", id: 1, result: 5 }) + "\n\n"
     test.ok(
-        mcp.result_of(json.decode(mcp.body_text(body))) == 5,
-        "mcp.result_of(json.decode(mcp.body_text(body))) == 5",
+        jsonrpc.result_of(json.decode(transport.body_text(body))) == 5,
+        "jsonrpc.result_of(json.decode(transport.body_text(body))) == 5",
     )
 })
 
 test.case("a plain JSON body is passed through untouched", fn() {
     body = json.encode({ jsonrpc: "2.0", id: 1, result: 7 })
-    test.ok(mcp.body_text(body) == body, "mcp.body_text(body) == body")
+    test.ok(transport.body_text(body) == body, "transport.body_text(body) == body")
 })
 
 test.case("a body that is neither JSON nor an SSE frame is refused", fn() {
     caught = try {
-        mcp.body_text("<html>gateway timeout</html>")
+        transport.body_text("<html>gateway timeout</html>")
         ""
     } catch (e) { e.message }
     test.ok(
