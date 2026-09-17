@@ -43,6 +43,36 @@ jobs:
           sudo install -m 0755 "$bin" /usr/local/bin/ecko
           ecko --version
 
+      # The toolchain has to be new enough for the line this tag belongs to.
+      #
+      # `dl/latest` is whatever core released last, which is not necessarily
+      # the core this package was written against. Tag a package before that
+      # release lands and the step below installs an older binary, the gate
+      # refuses source using a verb that does not exist yet, and the error
+      # names the verb rather than the cause. mysql-client and redis-client
+      # v0.23.0 both died exactly that way - tagged sixteen hours before core
+      # 0.23.0, refused for `io.close`, and left unpublished for eight days
+      # with nothing saying why. The git install path kept working, so nothing
+      # looked broken; only `releases/latest/download` silently served a
+      # thirteen-release-old zip.
+      #
+      # Compared on MAJOR.MINOR, so a package-only patch is not falsely
+      # refused: mime v0.10.2 against core 0.10.1 is fine, because it targets
+      # the 0.10 line and that line is out. `"ecko"` in ecko.json overrides the
+      # floor for a package that needs a different one from its own version.
+      - name: Toolchain is new enough for this version
+        run: |
+          have=$(ecko --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+          want=$(jq -r '.ecko // .version' ecko.json)
+          hm=${have%.*}
+          wm=${want%.*}
+          if [ "$(printf '%s\n%s\n' "$wm" "$hm" | sort -V | head -1)" != "$wm" ]; then
+            echo "::error::this package targets ecko $wm, but dl/latest is $have"
+            echo "::error::if core $wm is not released yet, publish it first and re-tag"
+            exit 1
+          fi
+          echo "toolchain $have satisfies the $wm line"
+
       # A published package that does not pass its own tests is worse than an
       # unpublished one: it goes out under a version number people will pin.
       - name: Check and test
