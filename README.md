@@ -11,7 +11,12 @@ MCP is JSON-RPC 2.0 with a fixed vocabulary: a handshake, then `tools/*`,
 ecko get github.com/ecko-lang/mcp
 ```
 
-## Calling a server
+## Usage
+
+MCP goes both directions: this package speaks to a server, and lets you be
+one.
+
+### Calling a server
 
 ```ecko
 import mcp
@@ -32,7 +37,7 @@ Hand the tools straight to a model:
 answer = ai "what changed in the changelog?" using mcp.as_tools(session)
 ```
 
-## Being a server
+### Being a server
 
 ```ecko
 import mcp
@@ -49,7 +54,7 @@ mcp.serve_stdio([
 
 Register it with a client by pointing it at `ecko your_server.ecko`.
 
-## Transports
+### Transports
 
 **stdio** is how almost every MCP server ships: the client starts the process
 and uses the pipes it already has, so there is no port and nothing to
