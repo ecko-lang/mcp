@@ -98,11 +98,38 @@ jobs:
       - name: Pack
         run: |
           # Named after the repository so `ecko get github.com/<owner>/<repo>`
-          # resolves to it. The archive is the manifest plus the sources at the
-          # root, which is the layout the package resolver expects. Deliberately
-          # non-recursive: tests/ and docs/ are not needed to use the package.
+          # resolves to it. The archive is the manifest, the sources at the
+          # root, and - when this package declares dependencies - the vendored
+          # copies of them plus the lock/sum files that pin them. A consumer's
+          # `ecko get` never fetches transitively, so a dependency left out of
+          # this zip is a dependency missing at the consumer's import time, no
+          # matter that it works in this checkout. tests/ and docs/ still stay
+          # out; they are not needed to use the package. -X keeps the archive
+          # byte-identical across repeated packs of the same sources.
           name="${GITHUB_REPOSITORY##*/}"
-          zip -X "$name.zip" ecko.json *.ecko
+
+          deps=$(jq -r '.dependencies // {} | keys | length' ecko.json)
+          if [ "$deps" != "0" ]; then
+            if [ ! -d vendor ]; then
+              echo "::error::ecko.json declares $deps dependency(ies) but there is no vendor/ directory - run 'ecko get' and commit the result before tagging"
+              exit 1
+            fi
+            missing=0
+            while IFS= read -r path; do
+              if [ ! -f "vendor/$path/ecko.json" ]; then
+                echo "::error::dependency '$path' is not vendored at vendor/$path/ecko.json - run 'ecko get' before tagging"
+                missing=1
+              fi
+            done < <(jq -r '.dependencies | to_entries[] | (.value | if type == "object" then .path else (split("@")[0]) end)' ecko.json)
+            [ "$missing" = "0" ] || exit 1
+          fi
+
+          extra=""
+          [ -f ecko.lock ] && extra="$extra ecko.lock"
+          [ -f ecko.sum ] && extra="$extra ecko.sum"
+          [ -d vendor ] && extra="$extra vendor"
+
+          zip -X -r "$name.zip" ecko.json *.ecko $extra
           unzip -l "$name.zip"
           echo "PKG_ZIP=$name.zip" >> "$GITHUB_ENV"
 
