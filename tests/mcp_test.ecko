@@ -72,7 +72,7 @@ test.case("request ids increase and never repeat", fn() {
     session = mcp.connect(s.transport)
     mcp.call(session, "tools/list")
     mcp.call(session, "tools/list")
-    ids = []
+    mut ids = []
     for m in cell_get(s.seen) {
         i = get(m, "id")
         unless is_null(i) { ids = push(ids, i) }

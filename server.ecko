@@ -257,7 +257,7 @@ fn default_of(value, fallback) = if is_null(value) { fallback } else { value }
 ## than sending a notification nobody is listening for.
 export fn progress(token, done, total = null) {
     if is_null(token) { return null }
-    params = { progressToken: token, progress: done }
+    mut params = { progressToken: token, progress: done }
     params = if is_null(total) { params } else { insert(params, "total", total) }
     { jsonrpc: "2.0", method: "notifications/progress", params: params }
 }

@@ -20,7 +20,7 @@ import "./jsonrpc.ecko" as rpc
 ##
 ## Needs the **net** capability.
 export fn http_transport(url, opts = {}) {
-    headers = get(opts, "headers")
+    mut headers = get(opts, "headers")
     headers = if is_null(headers) { {} } else { headers }
     headers = insert(headers, "Content-Type", "application/json")
     # MCP servers may answer a POST with either JSON or an SSE stream; saying we
@@ -76,7 +76,7 @@ export fn fake(handler) {
 ## Needs the **exec** capability to start the process. Nothing here touches the
 ## network.
 export fn stdio_transport(command, args = [], opts = {}) {
-    timeout = get(opts, "timeout_ms")
+    mut timeout = get(opts, "timeout_ms")
     timeout = if is_null(timeout) { 30000 } else { timeout }
     child = proc.spawn(command, args)
     # The child's pipes are streams. The deadline is set once, on the stream

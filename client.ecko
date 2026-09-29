@@ -12,9 +12,9 @@ import "./jsonrpc.ecko" as rpc
 ## session value carrying the transport, the server's reply, and the request-id
 ## counter - pass it to every call below.
 export fn connect(transport, info = {}) {
-    name = get(info, "name")
+    mut name = get(info, "name")
     name = if is_null(name) { "ecko" } else { name }
-    version = get(info, "version")
+    mut version = get(info, "version")
     version = if is_null(version) { "0.1.0" } else { version }
 
     # `next_id` is a cell because the id has to advance across calls that each
@@ -220,7 +220,7 @@ fn schema_params(schema) {
 ## which case it ignores this - which is why a caller must not treat sending it
 ## as proof the work stopped.
 export fn cancel(session, request_id, reason = "") {
-    params = { requestId: request_id }
+    mut params = { requestId: request_id }
     params = if reason == "" { params } else { insert(params, "reason", reason) }
     notify(session, "notifications/cancelled", params)
 }
