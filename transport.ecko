@@ -16,7 +16,7 @@ import "./jsonrpc.ecko" as rpc
 ## one JSON-RPC message, and the reply comes back in the response body.
 ##
 ## `opts` takes `headers` (for `Authorization`, which is how hosted MCP servers
-## authenticate) and `timeout` in seconds.
+## authenticate).
 ##
 ## Needs the **net** capability.
 export fn http_transport(url, opts = {}) {
@@ -27,7 +27,7 @@ export fn http_transport(url, opts = {}) {
     # accept both is what the spec requires of a Streamable HTTP client.
     headers = insert(headers, "Accept", "application/json, text/event-stream")
     { kind: "http", url: url, send: fn(text) {
-        r = http.post(url, text, headers)
+        r = http.post(url, body: text, headers: headers)
         if r.status < 200 or r.status >= 300 {
             rpc.fail("HTTP {r.status} from {url}", { status: r.status, body: r.body })
         }

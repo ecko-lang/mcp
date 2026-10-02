@@ -150,6 +150,10 @@ sections it actually declared, because a client branches on that.
 
 **A missing list reads as empty.** A server with no tools may answer `{}`.
 
+**The HTTP transport sends its body and headers since 0.55.1.** Before that it
+passed both positionally to `http.post`, which read neither, so every request
+went out empty and unauthenticated - a hosted server would have refused it.
+
 ## Not implemented
 
 Server-to-client requests (sampling, roots, elicitation), resource
