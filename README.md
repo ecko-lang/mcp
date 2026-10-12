@@ -93,6 +93,7 @@ capability at all.
 | `mcp.prompts(session)` / `mcp.get_prompt(session, name, args?)` | Prompts. |
 | `mcp.cancel(session, id, reason?)` / `mcp.next_request_id(session)` | Cancel a request. |
 | `mcp.call(session, method, params?)` / `mcp.notify(...)` | Anything not wrapped above. |
+| `mcp.request(id, method, params?)` / `mcp.notification(method, params?)` / `mcp.encode(message)` | Build and encode a raw JSON-RPC message. |
 
 ### Server
 
