@@ -32,7 +32,7 @@ jobs:
       # sibling repo ("../other/main.ecko") resolves in a local workspace
       # checkout and nowhere else, and has shipped broken inside a release
       # archive before.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Packages are Ecko source, so the toolchain is the released binary - the
       # same one release.yml installs. Pinning to `latest` is intentional: it

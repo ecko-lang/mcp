@@ -35,7 +35,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Packages are Ecko source, so the toolchain is the released binary,
       # deliberately `latest` rather than pinned: the question this workflow
