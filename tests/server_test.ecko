@@ -70,6 +70,15 @@ test.case("a notification gets no reply at all", fn() {
     test.ok(is_null(r), "no reply for a notification")
 })
 
+test.case("ping is answered with an empty result", fn() {
+    # Either side may ping to check the other is alive; the spec's answer is
+    # `{}`, and "method not found" reads as a broken server.
+    r = srv.handle(req(7, "ping"), tools())
+    test.eq(r.id, 7)
+    test.eq(r.result, {})
+    test.ok(is_null(get(r, "error")), "no error")
+})
+
 # ---------------------------------------------------------------------- tools
 
 test.case("tools/list returns the description and schema, never the handler", fn() {

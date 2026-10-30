@@ -103,7 +103,7 @@ capability at all.
 | `mcp.tool(name, description, schema, handler)` | Declare a tool. |
 | `mcp.resource(uri, name, mime, reader)` | Declare a resource. Read lazily. |
 | `mcp.prompt(name, description, arguments, renderer)` | Declare a prompt. |
-| `mcp.handle(request, offer, info?)` | Answer one decoded request. `null` for a notification. |
+| `mcp.handle(request, offer, info?)` | Answer one decoded request (`initialize`, `ping`, and the `tools`, `resources` and `prompts` methods). `null` for a notification. |
 | `mcp.handle_text(text, offer, info?)` | Decode, answer, re-encode. |
 | `mcp.text(value)` / `mcp.tool_error(message)` | Build content; report a tool failure. |
 | `mcp.progress(token, done, total?)` / `mcp.progress_token(request)` | Progress notifications. |

@@ -60,7 +60,9 @@ export fn prompt(name, description, arguments, renderer) = {
 }
 
 ## Answer one decoded JSON-RPC request. Returns the reply map, or `null` for a
-## notification, which by definition gets no reply.
+## notification, which by definition gets no reply. It answers `initialize`,
+## `ping` (with `{}`) and the `tools`, `resources` and `prompts` methods; any
+## other method is error -32601.
 ##
 ## `offer` is what this server exposes: `{ tools, resources, prompts }`, each
 ## optional. A bare list is taken as the tools, which is what almost every
@@ -78,6 +80,9 @@ export fn handle(request, offer, info = {}) {
     # initialized` is the one every client sends.
     if is_null(get(request, "id")) { return null }
     id = request.id
+
+    # Either side may ping to check the other is alive; the answer is `{}`.
+    if method == "ping" { return ok(id, {}) }
 
     if method == "initialize" {
         return ok(
