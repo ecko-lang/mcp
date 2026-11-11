@@ -1,4 +1,4 @@
-# Transports: how requests reach `handle` and replies get back.
+# Server transports: how requests reach `handle` and replies get back.
 #
 # Both are thin on purpose. The protocol lives in `server.ecko` and neither of
 # these knows anything about MCP beyond "one JSON object in, one out".
@@ -6,30 +6,34 @@
 import std.io
 import std.http
 import std.json
+import "./jsonrpc.ecko" as rpc
 import "./server.ecko" as proto
 
 ## Serve over stdio: one JSON-RPC message per line on standard input, one reply
-## per line on standard output.
+## per line on standard output. Blocks until standard input closes, which is
+## how the client says goodbye, then returns null.
 ##
-## This is the transport Claude Desktop and every local MCP server uses - the
+## This is the transport Claude Desktop and most local MCP clients use - the
 ## client spawns the program and talks to it over the pipes it already has, so
-## there is no port, no URL and nothing to authenticate.
+## there is no port, no URL and nothing to authenticate. A malformed or
+## failing request is answered with a JSON-RPC error and the server carries on.
 ##
 ## Needs **no capability**: standard input is handed to the process by whoever
-## started it, the same way its arguments are.
+## started it.
 ##
-##   import mcp_server as srv
-##   srv.serve_stdio([srv.tool(...)], { name: "my-server", version: "1.0" })
+## errors: `bug` when `offer` is neither a List nor a Map.
 ##
-## Blocks until standard input closes, which is how the client says goodbye.
-export fn serve_stdio(tools, info = {}) {
+## example:
+##   mcp.serve_stdio([mcp.tool("echo", "Repeat", { type: "object" }, fn(a) a.text)], name: "echo")
+export fn serve_stdio(offer, name = "ecko", version = "0.1.0") {
+    check_offer("serve_stdio", offer)
     loop {
         line = io.read_line()
         # End of input, not an empty line - the client closed the pipe.
         if is_null(line) { break }
         trimmed = trim(line)
         if trimmed == "" { continue }
-        reply = handle_text(trimmed, tools, info)
+        reply = handle_text(trimmed, offer, name: name, version: version)
         # A notification produces no reply, and writing a blank line for one
         # would desynchronise a client reading line by line.
         unless is_null(reply) { print(reply) }
@@ -38,32 +42,88 @@ export fn serve_stdio(tools, info = {}) {
 }
 
 ## Serve over HTTP: one JSON-RPC message per POST body, the reply in the
-## response body. MCP's Streamable HTTP shape, minus the optional SSE channel.
+## response body. MCP's Streamable HTTP shape, minus the optional SSE channel
+## (a `GET` is answered 405, which the spec allows). Blocks until the server
+## stops.
+##
+## Binds `host`, `127.0.0.1` by default, as the spec asks of a local server;
+## pass `host: "0.0.0.0"` to listen on every interface. A browser request whose
+## `Origin` is not loopback or listed in `origins` is refused with 403, which is
+## the spec's guard against DNS rebinding; a request with no `Origin` (any
+## non-browser client) is served.
 ##
 ## Needs the **net** capability.
-export fn serve_http(port, tools, info = {}) {
+##
+## errors: `bug` when `offer` is neither a List nor a Map, or `origins` is not
+## a List; what `http.serve` raises when it cannot bind.
+##
+## example:
+##   mcp.serve_http(8080, tools, name: "search", origins: ["https://app.example.com"])
+export fn serve_http(port, offer, name = "ecko", version = "0.1.0", host = "127.0.0.1", origins = []) {
+    check_offer("serve_http", offer)
+    if type_of(origins) != "list" {
+        rpc.bad_argument(
+            "serve_http",
+            "origins must be a List of origin strings, got {type_of(origins)}",
+        )
+    }
     http.serve(port, fn(req) {
+        origin = get(req.headers, "origin")
+        unless is_null(origin) or loopback_origin(origin) or contains(origins, origin) {
+            return http.response(403, "origin not allowed", {})
+        }
         if req.method != "POST" { return http.response(405, "POST a JSON-RPC message", {}) }
-        reply = handle_text(req.body, tools, info)
-        # 202 with no body is what the spec asks for on a notification: accepted,
-        # nothing to say.
+        reply = handle_text(req.body, offer, name: name, version: version)
+        # 202 with no body is what the spec asks for on a notification:
+        # accepted, nothing to say.
         if is_null(reply) { return http.response(202, "", {}) }
         http.response(200, reply, { "Content-Type": "application/json" })
-    })
+    }, host: host)
 }
 
-## Decode one message, answer it, and encode the reply. `null` when the message
-## was a notification.
+## Decode one message, answer it with `handle`, and encode the reply. `null`
+## when the message was a notification.
 ##
-## Malformed JSON is answered rather than thrown: a client that sends garbage
-## should get a parse error back, not a dropped connection.
-export fn handle_text(text, tools, info = {}) {
+## Never throws on what a client sends: malformed JSON is error -32700, and a
+## result that cannot be encoded as JSON is error -32603.
+##
+## errors: `bug` when `offer` is neither a List nor a Map.
+##
+## example:
+##   mcp.handle_text(r"""{"jsonrpc":"2.0","id":1,"method":"ping"}""", [])   # {"id":1,"jsonrpc":"2.0","result":{}}
+export fn handle_text(text, offer, name = "ecko", version = "0.1.0") {
+    check_offer("handle_text", offer)
     request = try { json.decode(text) } catch (e) {
         return json.encode(
             { jsonrpc: "2.0", id: null, error: { code: -32700, message: "parse error" } },
         )
     }
-    reply = proto.handle(request, tools, info)
+    reply = proto.handle(request, offer, name: name, version: version)
     if is_null(reply) { return null }
-    json.encode(reply)
+    try { json.encode(reply) } catch (e) {
+        json.encode(
+            {
+                jsonrpc: "2.0",
+                id: reply.id,
+                error: { code: -32603, message: "internal error: the result is not JSON" },
+            },
+        )
+    }
+}
+
+fn check_offer(fname, offer) {
+    unless type_of(offer) == "list" or type_of(offer) == "map" {
+        rpc.bad_argument(fname, "offer must be a List of tools or a Map, got {type_of(offer)}")
+    }
+}
+
+# An Origin naming this machine: http(s)://localhost, 127.0.0.1 or [::1], any port.
+fn loopback_origin(origin) {
+    for scheme in ["http://", "https://"] {
+        for h in ["localhost", "127.0.0.1", "[::1]"] {
+            base = scheme + h
+            if origin == base or starts_with(origin, base + ":") { return true }
+        }
+    }
+    false
 }

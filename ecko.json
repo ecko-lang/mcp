@@ -1,6 +1,6 @@
 {
   "module": "github.com/ecko-lang/mcp",
-  "version": "0.55.2",
+  "version": "0.56.0",
   "entrypoint": "main.ecko",
   "description": "Model Context Protocol, both directions: call an MCP server's tools over stdio or HTTP, or be one.",
   "author": "Sean Nieuwoudt <sean@underwulf.com>",
@@ -9,5 +9,6 @@
     "net",
     "exec"
   ],
-  "dependencies": {}
+  "dependencies": {},
+  "ecko": "0.81.0"
 }

@@ -1,25 +1,39 @@
 # Being an MCP server: answer the protocol, run the tools.
 #
-# The inverse of the `mcp` client package. A client asks `tools/list` and
-# `tools/call`; this answers them, with Ecko functions behind the names.
+# The inverse of the client half. A client asks `tools/list` and `tools/call`;
+# this answers them, with Ecko functions behind the names.
 #
 # `handle` is the whole protocol and touches nothing outside itself: give it a
-# decoded request map and a tool table, get a reply map back. That is what makes
-# the protocol testable without a socket or a pipe, and why the transports below
-# are thin.
+# decoded request map and an offer, get a reply map back. That is what makes
+# the protocol testable without a socket or a pipe, and why the transports in
+# serve.ecko are thin. It never throws on anything a client sends: a bad
+# request is a JSON-RPC error reply, because one bad message must not take a
+# server down for every other client message after it.
 
+import std.io
 import "./jsonrpc.ecko" as rpc
 
 ## Declare a tool: a name, a description the model reads, a JSON Schema for its
 ## arguments, and the function to run.
 ##
 ## `handler` takes the decoded argument map and returns either a string (the
-## common case) or a content list built with `text`.
-export fn tool(name, description, schema, handler) = {
-    name: name,
-    description: description,
-    inputSchema: schema,
-    handler: handler,
+## common case), a content list built with `text`, or a full result map. A
+## handler that throws becomes a tool error (`isError: true`) carrying its
+## message, not a dead server.
+##
+## errors: `bug` when `name` or `description` is not a String, `schema` is not
+## a Map, or `handler` is not a function.
+##
+## example:
+##   mcp.tool("echo", "Repeat the text", { type: "object" }, fn(args) args.text)
+export fn tool(name, description, schema, handler) {
+    check_string("tool", "name", name)
+    check_string("tool", "description", description)
+    if type_of(schema) != "map" {
+        rpc.bad_argument("tool", "schema must be a Map, got {type_of(schema)}")
+    }
+    check_fn("tool", "handler", handler)
+    { name: name, description: description, inputSchema: schema, handler: handler }
 }
 
 ## Wrap a value as MCP text content: `[{ type: "text", text: ... }]`.
@@ -27,36 +41,61 @@ export fn tool(name, description, schema, handler) = {
 ## MCP returns content as a list of typed parts, so even a one-line answer is a
 ## list. `handle` wraps a bare string for you; this is for a handler returning
 ## several parts deliberately.
+##
+## example:
+##   mcp.text(42)   # [{text: 42, type: text}]
 export fn text(value) = [{ type: "text", text: string(value) }]
 
-## Report a tool failure.
+## A tool result reporting failure: `{ content, isError: true }`.
 ##
 ## This is *not* a JSON-RPC error. The call succeeded and the tool failed, which
 ## MCP models as data on purpose so a model can read the failure and try
 ## something else. A JSON-RPC error means the call was rejected outright.
+##
+## example:
+##   fn(args) if args.n < 0 { mcp.tool_error("n must not be negative") } else { string(args.n) }
 export fn tool_error(message) = { content: text(message), isError: true }
 
 ## Declare a resource: something a client can read by URI.
 ##
 ## `reader` takes no arguments and returns the body as a string. Lazy on
 ## purpose - a server listing fifty documents should not read fifty files to
-## answer `resources/list`.
-export fn resource(uri, name, mime_type, reader) = {
-    uri: uri,
-    name: name,
-    mimeType: mime_type,
-    reader: reader,
+## answer `resources/list`. A reader that throws is answered as JSON-RPC
+## error -32603.
+##
+## errors: `bug` when `uri`, `name` or `mime_type` is not a String, or `reader`
+## is not a function.
+##
+## example:
+##   mcp.resource("memo://readme", "readme", "text/plain", fn() "the body")
+export fn resource(uri, name, mime_type, reader) {
+    check_string("resource", "uri", uri)
+    check_string("resource", "name", name)
+    check_string("resource", "mime_type", mime_type)
+    check_fn("resource", "reader", reader)
+    { uri: uri, name: name, mimeType: mime_type, reader: reader }
 }
 
 ## Declare a prompt template.
 ##
+## `arguments` is the list MCP describes (`[{ name, description, required }]`).
 ## `renderer` takes the decoded argument map and returns either a string (which
-## becomes one user message) or a full `messages` list.
-export fn prompt(name, description, arguments, renderer) = {
-    name: name,
-    description: description,
-    arguments: arguments,
-    renderer: renderer,
+## becomes one user message) or a full `messages` list. A renderer that throws
+## is answered as JSON-RPC error -32603.
+##
+## errors: `bug` when `name` or `description` is not a String, `arguments` is
+## not a List, or `renderer` is not a function.
+##
+## example:
+##   mcp.prompt("review", "Review some code", [{ name: "code", required: true }], fn(a) "review: {a.code}")
+export fn prompt(name, description, arguments, renderer) {
+    check_string("prompt", "name", name)
+    check_string("prompt", "description", description)
+    if type_of(arguments) != "list" {
+        rpc.bad_argument("prompt", "arguments must be a List, got {type_of(arguments)}")
+    }
+    check_fn("prompt", "renderer", renderer)
+    { name: name, description: description, arguments: arguments, renderer: renderer }
 }
 
 ## Answer one decoded JSON-RPC request. Returns the reply map, or `null` for a
@@ -66,20 +105,51 @@ export fn prompt(name, description, arguments, renderer) = {
 ##
 ## `offer` is what this server exposes: `{ tools, resources, prompts }`, each
 ## optional. A bare list is taken as the tools, which is what almost every
-## server offers and keeps the common call short.
+## server offers and keeps the common call short. `name` and `version` are the
+## `serverInfo` sent in the `initialize` reply.
 ##
-## `info` is `{ name, version }` for this server.
-export fn handle(request, offer, info = {}) {
-    offered = if type_of(offer) == "list" { { tools: offer } } else { offer }
+## Nothing a client sends makes this throw: a request that is not an object or
+## has no method is -32600, a bad parameter or cursor is -32602, and a failure
+## inside the server itself is -32603 (its detail goes to standard error, not to
+## the client).
+##
+## errors: `bug` when `offer` is neither a List nor a Map.
+##
+## example:
+##   mcp.handle({ jsonrpc: "2.0", id: 1, method: "ping" }, [])   # {id: 1, jsonrpc: 2.0, result: {}}
+export fn handle(request, offer, name = "ecko", version = "0.1.0") {
+    offered = if type_of(offer) == "list" {
+        { tools: offer }
+    } else if type_of(offer) == "map" {
+        offer
+    } else {
+        rpc.bad_argument("handle", "offer must be a List of tools or a Map, got {type_of(offer)}")
+    }
+    if type_of(request) != "map" { return err(null, -32600, "invalid request: not a JSON object") }
+    method = get(request, "method")
+    has_id = contains(keys(request), "id")
+    id = get(request, "id")
+    if type_of(method) != "string" { return err(id, -32600, "invalid request: no method") }
+    # A notification has no id and must not be answered. `notifications/
+    # initialized` is the one every client sends.
+    unless has_id { return null }
+    unless type_of(id) == "int" or type_of(id) == "string" {
+        return err(null, -32600, "invalid request: id must be a string or an integer")
+    }
+    params = default_of(get(request, "params"), {})
+    if type_of(params) != "map" { return err(id, -32602, "invalid params: not an object") }
+    try { dispatch(id, method, params, offered, name, version) } catch (e) {
+        # The server's own fault. The detail is for whoever runs the server,
+        # and may name files or internals, so it goes to stderr, not the wire.
+        try { io.write(io.stderr(), "mcp: {method} failed: {message_of(e)}\n") }
+        err(id, -32603, "internal error handling {method}")
+    }
+}
+
+fn dispatch(id, method, params, offered, name, version) {
     tools = default_of(get(offered, "tools"), [])
     resources = default_of(get(offered, "resources"), [])
     prompts = default_of(get(offered, "prompts"), [])
-    method = get(request, "method")
-    if is_null(method) { return err(get(request, "id"), -32600, "not a JSON-RPC request") }
-    # A notification has no id and must not be answered. `notifications/
-    # initialized` is the one every client sends.
-    if is_null(get(request, "id")) { return null }
-    id = request.id
 
     # Either side may ping to check the other is alive; the answer is `{}`.
     if method == "ping" { return ok(id, {}) }
@@ -90,17 +160,14 @@ export fn handle(request, offer, info = {}) {
             {
                 protocolVersion: rpc.PROTOCOL_VERSION,
                 capabilities: advertised(tools, resources, prompts),
-                serverInfo: {
-                    name: default_of(get(info, "name"), "ecko"),
-                    version: default_of(get(info, "version"), "0.1.0"),
-                },
+                serverInfo: { name: name, version: version },
             },
         )
     }
 
     if method == "tools/list" {
-        params = default_of(get(request, "params"), {})
         window = page_of(tools, get(params, "cursor"))
+        if is_null(window) { return bad_cursor(id, params) }
         # The handler is ours, not the client's business - send only what the
         # protocol describes, or the reply fails to encode as JSON.
         listed = map(window.items, fn(t) {
@@ -110,27 +177,27 @@ export fn handle(request, offer, info = {}) {
     }
 
     if method == "tools/call" {
-        params = default_of(get(request, "params"), {})
-        name = get(params, "name")
-        found = find_tool(tools, name)
+        tool_name = get(params, "name")
+        found = find_by(tools, "name", tool_name)
         if is_null(found) {
             # An unknown tool is a rejected call, not a failed one.
-            return err(id, -32602, "no such tool: {name}")
+            return err(id, -32602, "no such tool: {tool_name}")
         }
         args = default_of(get(params, "arguments"), {})
+        if type_of(args) != "map" { return err(id, -32602, "arguments must be an object") }
         # A handler that throws is a crashed tool, not a broken server: report it
         # as a tool error so the session survives and the model can react.
         result = try {
             normalize(found.handler(args))
         } catch (e) {
-            tool_error("tool '{name}' failed: {e.message}")
+            tool_error("tool '{tool_name}' failed: {message_of(e)}")
         }
         return ok(id, result)
     }
 
     if method == "resources/list" {
-        params = default_of(get(request, "params"), {})
         window = page_of(resources, get(params, "cursor"))
+        if is_null(window) { return bad_cursor(id, params) }
         listed = map(window.items, fn(r) {
             { uri: r.uri, name: r.name, mimeType: r.mimeType }
         })
@@ -138,7 +205,6 @@ export fn handle(request, offer, info = {}) {
     }
 
     if method == "resources/read" {
-        params = default_of(get(request, "params"), {})
         uri = get(params, "uri")
         found = find_by(resources, "uri", uri)
         if is_null(found) { return err(id, -32602, "no such resource: {uri}") }
@@ -147,7 +213,7 @@ export fn handle(request, offer, info = {}) {
         body = try {
             found.reader()
         } catch (e) {
-            return err(id, -32603, "reading {uri}: {e.message}")
+            return err(id, -32603, "reading {uri}: {message_of(e)}")
         }
         return ok(
             id,
@@ -156,8 +222,8 @@ export fn handle(request, offer, info = {}) {
     }
 
     if method == "prompts/list" {
-        params = default_of(get(request, "params"), {})
         window = page_of(prompts, get(params, "cursor"))
+        if is_null(window) { return bad_cursor(id, params) }
         listed = map(window.items, fn(p) {
             { name: p.name, description: p.description, arguments: p.arguments }
         })
@@ -165,15 +231,15 @@ export fn handle(request, offer, info = {}) {
     }
 
     if method == "prompts/get" {
-        params = default_of(get(request, "params"), {})
-        name = get(params, "name")
-        found = find_by(prompts, "name", name)
-        if is_null(found) { return err(id, -32602, "no such prompt: {name}") }
+        prompt_name = get(params, "name")
+        found = find_by(prompts, "name", prompt_name)
+        if is_null(found) { return err(id, -32602, "no such prompt: {prompt_name}") }
         args = default_of(get(params, "arguments"), {})
+        if type_of(args) != "map" { return err(id, -32602, "arguments must be an object") }
         rendered = try {
             found.renderer(args)
         } catch (e) {
-            return err(id, -32603, "rendering {name}: {e.message}")
+            return err(id, -32603, "rendering {prompt_name}: {message_of(e)}")
         }
         return ok(id, { description: found.description, messages: as_messages(rendered) })
     }
@@ -181,33 +247,42 @@ export fn handle(request, offer, info = {}) {
     err(id, -32601, "method not found: {method}")
 }
 
-## How many entries one `*/list` page carries.
+## How many entries one `*/list` page carries when serving (100).
 ##
 ## MCP leaves the size to the server. Small enough that pagination is exercised
 ## rather than theoretical, large enough that an ordinary server sends one page.
 export let PAGE_SIZE = 100
 
-## One page of a list, and whether more follows.
-##
-## The cursor is the index of the next item, as a string - opaque to the client
-## by design, so it can change shape later without breaking one.
+# One page of a list and whether more follows, or null for a cursor this server
+# did not hand out.
+#
+# The cursor is the index of the next item as a decimal string - opaque to the
+# client by design. Anything else (not a string, not canonical digits, out of
+# range) is refused rather than clamped.
 fn page_of(items, cursor) {
-    start = if is_null(cursor) { 0 } else { int(cursor) }
-    if start < 0 or start > len(items) { rpc.fail("bad pagination cursor: {cursor}") }
+    mut start = 0
+    unless is_null(cursor) {
+        if type_of(cursor) != "string" { return null }
+        n = try { int(cursor) } catch (e) { return null }
+        if string(n) != cursor or n < 0 or n > len(items) { return null }
+        start = n
+    }
     stop = if start + PAGE_SIZE > len(items) { len(items) } else { start + PAGE_SIZE }
     { items: items[start..stop], next: if stop < len(items) { string(stop) } else { null } }
 }
 
-## Attach `nextCursor` when there is another page, and not otherwise. A cursor
-## that is always present would make a client loop forever.
+fn bad_cursor(id, params) = err(id, -32602, "invalid cursor: {get(params, "cursor")}")
+
+# Attach `nextCursor` when there is another page, and not otherwise. A cursor
+# that is always present would make a client loop forever.
 fn with_cursor(result, window) {
     if is_null(window.next) { return result }
     insert(result, "nextCursor", window.next)
 }
 
-## Advertise only the sections this server actually offers. A client branches on
-## this, so claiming `resources` with none declared invites a call that can only
-## answer method-not-found.
+# Advertise only the sections this server actually offers. A client branches on
+# this, so claiming `resources` with none declared invites a call that can only
+# answer method-not-found.
 fn advertised(tools, resources, prompts) {
     mut caps = {}
     if len(tools) > 0 { caps = insert(caps, "tools", {}) }
@@ -216,30 +291,23 @@ fn advertised(tools, resources, prompts) {
     caps
 }
 
-## A renderer may answer with a string or a full messages list; a bare string is
-## the common case and becomes one user message.
+# A renderer may answer with a string or a full messages list; a bare string is
+# the common case and becomes one user message.
 fn as_messages(rendered) {
     if type_of(rendered) == "list" { return rendered }
     [{ role: "user", content: { type: "text", text: string(rendered) } }]
 }
 
-## Find a declared thing by one of its fields.
+# Find a declared thing by one of its fields.
 fn find_by(items, field, value) {
+    if is_null(value) { return null }
     for i in items {
         if get(i, field) == value { return i }
     }
     null
 }
 
-## Find a declared tool by name, or null.
-fn find_tool(tools, name) {
-    for t in tools {
-        if t.name == name { return t }
-    }
-    null
-}
-
-## Wrap whatever a handler returned into an MCP result.
+# Wrap whatever a handler returned into an MCP result.
 fn normalize(value) {
     # A list is already content - `text()` returns one, and a handler building
     # several parts returns one. Wrapping it again would stringify the list.
@@ -249,18 +317,50 @@ fn normalize(value) {
     { content: text(value) }
 }
 
+# The message of a caught error, whatever was thrown: a map's `message`, or the
+# value itself (`error("boom")` throws the string).
+fn message_of(e) {
+    if type_of(e) == "map" and not is_null(get(e, "message")) { return string(e["message"]) }
+    string(e)
+}
+
+fn check_string(fname, arg, value) {
+    if type_of(value) != "string" {
+        rpc.bad_argument(fname, "{arg} must be a String, got {type_of(value)}")
+    }
+}
+
+fn check_fn(fname, arg, value) {
+    if type_of(value) != "function" {
+        rpc.bad_argument(fname, "{arg} must be a function, got {type_of(value)}")
+    }
+}
+
 fn ok(id, result) = { jsonrpc: "2.0", id: id, result: result }
 
 fn err(id, code, message) = { jsonrpc: "2.0", id: id, error: { code: code, message: message } }
 
 fn default_of(value, fallback) = if is_null(value) { fallback } else { value }
 
-## Report progress on a long-running request.
+## A progress notification for a long-running request, or `null` when `token`
+## is null (the client did not ask for progress, so nobody is listening).
 ##
-## `token` is the `progressToken` the client sent in the request's `_meta`;
-## without one the client did not ask for progress and this returns null rather
-## than sending a notification nobody is listening for.
+## `token` is the `progressToken` the client sent in the request's `_meta`
+## (`progress_token` reads it). Note that a tool handler receives only its
+## arguments, so `serve_stdio` and `serve_http` give it no way to send this;
+## it is for a server built directly on `handle`.
+##
+## errors: `bug` when `done` (or a non-null `total`) is not a number.
+##
+## example:
+##   mcp.progress("tok", 3, 10)   # a notifications/progress message with progress 3 of 10
 export fn progress(token, done, total = null) {
+    unless type_of(done) == "int" or type_of(done) == "float" {
+        rpc.bad_argument("progress", "done must be a number, got {type_of(done)}")
+    }
+    unless is_null(total) or type_of(total) == "int" or type_of(total) == "float" {
+        rpc.bad_argument("progress", "total must be a number or null, got {type_of(total)}")
+    }
     if is_null(token) { return null }
     mut params = { progressToken: token, progress: done }
     params = if is_null(total) { params } else { insert(params, "total", total) }
@@ -268,7 +368,11 @@ export fn progress(token, done, total = null) {
 }
 
 ## The progress token a request carries, or null if the client did not ask.
+##
+## example:
+##   mcp.progress_token(request)   # the value of params._meta.progressToken
 export fn progress_token(request) {
+    if type_of(request) != "map" { return null }
     params = get(request, "params")
     if type_of(params) != "map" { return null }
     meta = get(params, "_meta")
@@ -276,7 +380,8 @@ export fn progress_token(request) {
     get(meta, "progressToken")
 }
 
-## Announce that the tool list changed, so a client can re-read it.
+## The notification announcing that the tool list changed, so a client can
+## re-read it.
 ##
 ## A session holds whatever `tools/list` returned when it connected; without
 ## this a server that gains or loses a tool is talking to a stale client.
@@ -286,14 +391,14 @@ export fn tools_changed() = {
     params: {},
 }
 
-## The same for resources and prompts.
+## The notification announcing that the resource list changed.
 export fn resources_changed() = {
     jsonrpc: "2.0",
     method: "notifications/resources/list_changed",
     params: {},
 }
 
-## The same, for the prompt list.
+## The notification announcing that the prompt list changed.
 export fn prompts_changed() = {
     jsonrpc: "2.0",
     method: "notifications/prompts/list_changed",

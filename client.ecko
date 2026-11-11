@@ -6,17 +6,25 @@
 import "./jsonrpc.ecko" as rpc
 
 ## Open a session: send `initialize`, then the `notifications/initialized` the
-## spec requires before any other call.
+## spec requires before any other call. Returns a session value carrying the
+## transport, the server's reply and the request-id counter - pass it to every
+## call below.
 ##
-## `info` names this client to the server (`{ name, version }`). Returns a
-## session value carrying the transport, the server's reply, and the request-id
-## counter - pass it to every call below.
-export fn connect(transport, info = {}) {
-    mut name = get(info, "name")
-    name = if is_null(name) { "ecko" } else { name }
-    mut version = get(info, "version")
-    version = if is_null(version) { "0.1.0" } else { version }
-
+## `name` and `version` identify this client to the server (`clientInfo`).
+##
+## errors: `bug` when `transport` is not a transport value; otherwise whatever
+## the first `call` raises (`mcp`/`server_error`, `mcp`/`bad_reply`, the
+## transport's own errors).
+##
+## example:
+##   session = mcp.connect(mcp.stdio_transport("my-server"), name: "app", version: "2.0")
+export fn connect(transport, name = "ecko", version = "0.1.0") {
+    if type_of(transport) != "map" or type_of(get(transport, "send")) != "function" {
+        rpc.bad_argument(
+            "connect",
+            "transport must be a value from http_transport, stdio_transport or fake",
+        )
+    }
     # `next_id` is a cell because the id has to advance across calls that each
     # take the session by value. Every request in a connection needs its own.
     session = { transport: transport, next_id: cell(1), server: {} }
@@ -46,8 +54,20 @@ export fn server_capabilities(session) {
     if is_null(c) { {} } else { c }
 }
 
-## Send one request and return its result, raising on a JSON-RPC error.
+## Send one request and return its result. For any method the wrappers below
+## do not cover.
+##
+## errors: `mcp`/`server_error` (carrying the server's `code`) when the server
+## answers with a JSON-RPC error; `mcp`/`bad_reply` or `mcp`/`id_mismatch` when
+## the reply is malformed or answers another request; the transport's own
+## errors.
+##
+## example:
+##   mcp.call(session, "completion/complete", { ref: ref, argument: arg })
 export fn call(session, method, params = {}) {
+    if type_of(method) != "string" {
+        rpc.bad_argument("call", "method must be a String, got {type_of(method)}")
+    }
     id = cell_get(session.next_id)
     cell_set(session.next_id, id + 1)
     text = rpc.encode(rpc.request(id, method, params))
@@ -55,32 +75,53 @@ export fn call(session, method, params = {}) {
     rpc.reply_for(id, reply)
 }
 
-## Send a notification: no id, no reply, nothing to wait for.
+## Send a notification: no id, no reply, nothing to wait for. Returns null.
+##
+## errors: the transport's own errors (`mcp`/`http_status`, `net`).
+##
+## example:
+##   mcp.notify(session, "notifications/roots/list_changed")
 export fn notify(session, method, params = {}) {
     session.transport.send(rpc.encode(rpc.notification(method, params)))
     null
 }
 
-## Close the transport. A no-op for HTTP; the seam matters for a transport that
-## owns a socket or a child process.
+## Close the transport: stop a stdio server's process, or end an HTTP session
+## the server opened. Returns null.
 export fn close(session) = session.transport.close()
 
 # ---------------------------------------------------------------------- tools
 
-## The tools the server offers: `[{ name, description, inputSchema }]`.
+## The tools the server offers, `[{ name, description, inputSchema }]`,
+## following pagination to the end.
+##
+## errors: `mcp`/`repeated_cursor` or `mcp`/`too_many_pages` when the server's
+## pagination never ends; `mcp`/`bad_reply` when `tools` is not a list; and
+## what `call` raises.
+##
+## example:
+##   for t in mcp.tools(session) { print(t.name) }
 export fn tools(session) = paged(session, "tools/list", "tools")
 
 ## Call a tool by name. `args` is the argument map its `inputSchema` describes.
 ##
-## Returns the raw result, which carries `content` and may carry `isError`. Use
-## `text_of` for the common case of a tool that answers with text.
+## Returns the raw result, which carries `content` and may carry `isError` (a
+## tool that ran and failed, which is data, not an error). Use `text_of` for
+## the common case of a tool that answers with text.
+##
+## errors: `mcp`/`server_error` when the server rejects the call (an unknown
+## tool is -32602), and what `call` raises.
+##
+## example:
+##   mcp.text_of(mcp.call_tool(session, "search", { query: "ecko" }))
 export fn call_tool(session, name, args = {}) = call(
     session,
     "tools/call",
     { name: name, arguments: args },
 )
 
-## The text parts of a tool result, joined.
+## The text parts of a tool result, joined into one String ("" when there
+## are none).
 ##
 ## MCP returns content as a list of typed parts (`text`, `image`, `resource`);
 ## this takes the text ones and leaves the rest, because a caller that wants an
@@ -105,10 +146,19 @@ export fn is_error(result) = get(result, "isError") == true
 
 # ------------------------------------------------------------------ resources
 
-## The resources the server exposes: `[{ uri, name, mimeType }]`.
+## The resources the server exposes, `[{ uri, name, mimeType }]`, following
+## pagination to the end.
+##
+## errors: as `tools`.
 export fn resources(session) = paged(session, "resources/list", "resources")
 
-## Read one resource by URI. Returns `[{ uri, mimeType, text }]`.
+## Read one resource by URI. Returns its `contents`, `[{ uri, mimeType, text }]`.
+##
+## errors: `mcp`/`server_error` when the server refuses (an unknown URI is
+## -32602), and what `call` raises.
+##
+## example:
+##   mcp.read_resource(session, "memo://readme")[0].text
 export fn read_resource(session, uri) {
     r = call(session, "resources/read", { uri: uri })
     list_field(r, "contents")
@@ -116,10 +166,19 @@ export fn read_resource(session, uri) {
 
 # -------------------------------------------------------------------- prompts
 
-## The prompt templates the server offers: `[{ name, description, arguments }]`.
+## The prompt templates the server offers, `[{ name, description, arguments }]`,
+## following pagination to the end.
+##
+## errors: as `tools`.
 export fn prompts(session) = paged(session, "prompts/list", "prompts")
 
 ## Render a prompt template. Returns the server's `messages` list.
+##
+## errors: `mcp`/`server_error` when the server refuses (an unknown prompt is
+## -32602), and what `call` raises.
+##
+## example:
+##   mcp.get_prompt(session, "review", { code: "fn f() = 1" })
 export fn get_prompt(session, name, args = {}) {
     r = call(session, "prompts/get", { name: name, arguments: args })
     list_field(r, "messages")
@@ -127,16 +186,16 @@ export fn get_prompt(session, name, args = {}) {
 
 # ---------------------------------------------------------------------- shared
 
-## Follow a cursor to the end of a paginated list.
-##
-## MCP paginates `*/list`: a reply may carry `nextCursor`, and the rest only
-## arrives if you ask for it. Reading the first page and stopping is the worst
-## kind of bug - a server with more tools than fit one page returns a short list
-## and nothing says it was truncated, so a model is simply never told about the
-## rest.
-##
-## `MAX_PAGES` bounds it: a server that returns the same cursor forever would
-## otherwise loop until the process dies.
+# Follow a cursor to the end of a paginated list.
+#
+# MCP paginates `*/list`: a reply may carry `nextCursor`, and the rest only
+# arrives if you ask for it. Reading the first page and stopping is the worst
+# kind of bug - a server with more tools than fit one page returns a short list
+# and nothing says it was truncated, so a model is simply never told about the
+# rest.
+#
+# `MAX_PAGES` bounds it: a server that returns the same cursor forever would
+# otherwise loop until the process dies.
 fn paged(session, method, field) {
     mut out = []
     mut cursor = null
@@ -151,32 +210,31 @@ fn paged(session, method, field) {
         # A repeated cursor means the server is not advancing. Stop rather than
         # spin, and say so - silently returning a partial list is what this
         # whole function exists to avoid.
-        if contains(seen, cursor) { rpc.fail("server repeated pagination cursor for {method}") }
+        if contains(seen, cursor) {
+            rpc.fail("repeated_cursor", "server repeated pagination cursor for {method}")
+        }
         seen = push(seen, cursor)
         page = page + 1
-        if page >= MAX_PAGES { rpc.fail("{method} exceeded {MAX_PAGES} pages") }
+        if page >= MAX_PAGES { rpc.fail("too_many_pages", "{method} exceeded {MAX_PAGES} pages") }
     }
 }
 
-## How many pages of a `*/list` to follow before giving up on a server that
-## never stops paginating.
+## How many pages of a `*/list` the client follows (1000) before giving up on
+## a server that never stops paginating.
 export let MAX_PAGES = 1000
 
-## Read a list-valued field, treating a missing one as empty.
-##
-## A server that has no tools may answer `{}` rather than `{"tools": []}`, and
-## both mean the same thing to a caller iterating the result.
+# Read a list-valued field, treating a missing one as empty.
+#
+# A server that has no tools may answer `{}` rather than `{"tools": []}`, and
+# both mean the same thing to a caller iterating the result.
 fn list_field(result, name) {
     v = get(result, name)
     if is_null(v) { return [] }
-    if type_of(v) != "list" { rpc.fail("server sent a non-list '{name}'") }
+    if type_of(v) != "list" { rpc.fail("bad_reply", "server sent a non-list '{name}'") }
     v
 }
 
 ## The server's tools as specs `ai ... using` can take.
-##
-##   session = mcp.connect(mcp.http_transport(url))
-##   answer = ai "what changed in the changelog?" using mcp.as_tools(session)
 ##
 ## This is the point of the package: the model picks a tool, Ecko calls it over
 ## MCP, and the result goes back into the conversation. Without it a caller has
@@ -184,15 +242,27 @@ fn list_field(result, name) {
 ##
 ## The parameter names come from the tool's own `inputSchema`, so the model is
 ## told what the server says it accepts.
+##
+## errors: as `tools`.
+##
+## example:
+##   answer = ai "what changed in the changelog?" using mcp.as_tools(session)
 export fn as_tools(session) {
     map(tools(session), fn(t) as_tool(session, t))
 }
 
-## One declared tool as a spec. Useful when a server offers fifty and the
-## program should only expose three.
-## The `call` closure holds the session, so invoking the tool is a round trip to
-## the server rather than anything local.
+## One declared tool (an entry of `tools(session)`) as a spec. Useful when a
+## server offers fifty and the program should only expose three. The spec's
+## `call` holds the session, so invoking the tool is a round trip to the server.
+##
+## errors: `bug` when `t` is not a Map with a String `name`.
+##
+## example:
+##   search = mcp.as_tool(session, find(mcp.tools(session), fn(t) t.name == "search"))
 export fn as_tool(session, t) {
+    if type_of(t) != "map" or type_of(get(t, "name")) != "string" {
+        rpc.bad_argument("as_tool", "t must be a tool map with a String name, got {type_of(t)}")
+    }
     desc = get(t, "description")
     {
         name: t.name,
@@ -202,10 +272,10 @@ export fn as_tool(session, t) {
     }
 }
 
-## The argument names a JSON Schema declares, in a stable order.
-##
-## Sorted because Ecko maps are unordered: leaving it to iteration order would
-## give the model a different signature run to run.
+# The argument names a JSON Schema declares, in a stable order.
+#
+# Sorted because Ecko maps are unordered: leaving it to iteration order would
+# give the model a different signature run to run.
 fn schema_params(schema) {
     if type_of(schema) != "map" { return [] }
     props = get(schema, "properties")
@@ -213,19 +283,25 @@ fn schema_params(schema) {
     sort(keys(props))
 }
 
-## Tell the server to stop working on a request.
+## Tell the server to stop working on a request. Returns null.
 ##
 ## MCP models cancellation as a notification, not a request: there is nothing to
 ## wait for and no acknowledgement. The server may already have finished, in
 ## which case it ignores this - which is why a caller must not treat sending it
 ## as proof the work stopped.
+##
+## errors: the transport's own errors.
+##
+## example:
+##   id = mcp.next_request_id(session)   # the id of the call about to be made
+##   mcp.cancel(session, id, "user pressed stop")
 export fn cancel(session, request_id, reason = "") {
     mut params = { requestId: request_id }
     params = if reason == "" { params } else { insert(params, "reason", reason) }
     notify(session, "notifications/cancelled", params)
 }
 
-## The id the next `call` on this session will use.
+## The id the next `call` on this session will use, an Int.
 ##
 ## Needed to cancel: the id has to be known before the request is sent, and
 ## `call` allocates it internally.

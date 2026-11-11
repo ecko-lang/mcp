@@ -86,3 +86,43 @@ jobs:
             ecko doc main.ecko | grep -B2 'Undocumented' | grep '^## `' || true
             exit 1
           fi
+
+      # Every ```ecko block in the README is a program a reader will paste.
+      # Unmarked blocks must pass `ecko check` and run; `ecko norun` blocks
+      # (a server, the network, a terminal) are checked only; `ecko fragment`
+      # blocks are skipped. The package is vendored the way a user's project
+      # vendors it, so `import <alias>` resolves exactly as it does for them.
+      # A `##` on a private definition fails too: `ecko doc` lists it as
+      # "not exported", and it lands on the public API page.
+      - name: README examples
+        run: |
+          set -euo pipefail
+          pkg_dir=$(pwd)
+          module=$(jq -r .module ecko.json)
+          version=$(jq -r .version ecko.json)
+          alias=$(awk '/^```ecko/{c=1;next} /^```/{c=0} c && /^import [a-z_]/ && !/^import std/{print $2; exit}' README.md)
+          test -n "$alias" || { echo "::error::README shows no 'import <package>' line"; exit 1; }
+          work=$(mktemp -d)
+          mkdir -p "$work/vendor/$(dirname "$module")"
+          cp -r "$pkg_dir" "$work/vendor/$module"
+          caps=$(jq -c '.capabilities // []' ecko.json)
+          jq -n --arg a "$alias" --arg p "$module" --arg v "$version" --argjson g "$caps" \
+            '{module: "readme.check/blocks", version: "0.0.0", entrypoint: "main.ecko", dependencies: {($a): {path: $p, version: $v, grant: $g}}}' > "$work/ecko.json"
+          awk -v dir="$work" '
+            /^```ecko/ { n++; mode = $2 == "" ? "run" : $2; f = sprintf("%s/block%02d.%s.ecko", dir, n, mode); inb = 1; next }
+            /^```/ && inb { inb = 0; close(f); next }
+            inb { print > f }' README.md
+          fail=0
+          cd "$work"
+          for f in block*.ecko; do
+            [ -e "$f" ] || continue
+            case "$f" in *.fragment.ecko) continue ;; esac
+            if ! ecko check "$f" > out.txt 2>&1; then echo "::error::README $f fails ecko check"; cat out.txt; sed 's/^/    /' "$f"; fail=1; continue; fi
+            case "$f" in *.norun.ecko) continue ;; esac
+            if ! timeout 60 ecko "$f" > out.txt 2>&1; then echo "::error::README $f fails when run"; cat out.txt; sed 's/^/    /' "$f"; fail=1; fi
+          done
+          cd "$pkg_dir"
+          if ecko doc main.ecko | grep -q 'not exported'; then
+            echo "::error::'##' on a private definition (ecko doc lists it as not exported)"; ecko doc main.ecko | grep -B2 'not exported'; fail=1
+          fi
+          exit $fail

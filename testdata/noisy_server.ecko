@@ -1,0 +1,37 @@
+# A scripted stdio MCP server for tests/stdio_test.ecko. Before every reply it
+# writes a log notification and a ping request, the way real servers interleave
+# messages; it records the client's answer to the ping and reports it back in
+# the `tools/call` result.
+
+import std.io
+import std.json
+
+mut pings_answered = 0
+loop {
+    line = io.read_line()
+    if is_null(line) { break }
+    m = json.decode(line)
+    if is_null(get(m, "method")) {
+        # The client's answer to our ping.
+        if get(m, "id") == "srv-ping" and get(m, "result") == {} { pings_answered += 1 }
+        continue
+    }
+    if is_null(get(m, "id")) { continue }
+    print(
+        json.encode(
+            {
+                jsonrpc: "2.0",
+                method: "notifications/message",
+                params: { level: "info", data: "working" },
+            },
+        ),
+    )
+    print(json.encode({ jsonrpc: "2.0", id: "srv-ping", method: "ping" }))
+    print(json.encode({ jsonrpc: "2.0", id: 999, result: "stale" }))
+    result = match m.method {
+        "initialize" => { protocolVersion: "2025-06-18", capabilities: { tools: {} } }
+        "tools/call" => { content: [{ type: "text", text: "pings answered: {pings_answered}" }] }
+        _ => {}
+    }
+    print(json.encode({ jsonrpc: "2.0", id: m.id, result: result }))
+}

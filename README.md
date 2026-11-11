@@ -1,9 +1,9 @@
 # mcp
 
-Model Context Protocol, both directions. Call an MCP server's tools, or be one.
-
-MCP is JSON-RPC 2.0 with a fixed vocabulary: a handshake, then `tools/*`,
-`resources/*` and `prompts/*`.
+The Model Context Protocol, both directions: call an MCP server's tools,
+resources and prompts over stdio or HTTP, or be an MCP server. Needs `exec` to
+start a stdio server and `net` for HTTP; grant them when you import the
+package. A stdio server and the in-memory `fake` transport need nothing.
 
 ## Install
 
@@ -11,155 +11,229 @@ MCP is JSON-RPC 2.0 with a fixed vocabulary: a handshake, then `tools/*`,
 ecko get github.com/ecko-lang/mcp
 ```
 
+`ecko get` writes the dependency into your `ecko.json`; add the grant for the
+transports you use there:
+
+```json
+{
+  "dependencies": {
+    "mcp": {
+      "path": "github.com/ecko-lang/mcp",
+      "version": "0.56.0",
+      "grant": ["exec", "net"]
+    }
+  }
+}
+```
+
+```ecko
+import mcp
+```
+
 ## Usage
 
-MCP goes both directions: this package speaks to a server, and lets you be
-one.
-
-### Calling a server
-
-```ecko
-import mcp
-
-session = mcp.connect(mcp.stdio_transport("npx", ["-y", "@some/mcp-server"]))
-
-for t in mcp.tools(session) {
-    print("{t.name}: {t.description}")
-}
-
-print(mcp.text_of(mcp.call_tool(session, "search", { query: "ecko" })))
-mcp.close(session)
-```
-
-Hand the tools straight to a model:
-
-```ecko
-answer = ai "what changed in the changelog?" using mcp.as_tools(session)
-```
-
-### Being a server
+A server is a list of tools backed by Ecko functions; a client connects to it
+through a transport. Here the transport is `fake`, which calls the server in
+memory, so this runs offline:
 
 ```ecko
 import mcp
 
-mcp.serve_stdio([
+tools = [
     mcp.tool(
         "word_count",
         "Count the words in some text",
         { type: "object", properties: { text: { type: "string" } }, required: ["text"] },
-        fn(args) len(split(trim(args.text), " ")),
+        fn(args) len(filter(split(args.text, " "), fn(w) w != "")),
     ),
-], { name: "words", version: "1.0" })
+]
+
+session = mcp.connect(mcp.fake(fn(req) mcp.handle(req, tools, name: "words")))
+print(session.server.serverInfo.name)                    # words
+print(map(mcp.tools(session), fn(t) t.name))             # [word_count]
+
+result = mcp.call_tool(session, "word_count", { text: "a b  c" })
+print(mcp.text_of(result))                               # 3
+print(mcp.is_error(result))                              # false
+
+missing = try { mcp.call_tool(session, "nope") } catch (e) { get(e, "code") }
+print(missing)                                           # -32602
+mcp.close(session)
 ```
 
-Register it with a client by pointing it at `ecko your_server.ecko`.
+### Calling a real server
 
-### Transports
+Most MCP servers are programs the client starts and talks to over their pipes:
 
-**stdio** is how almost every MCP server ships: the client starts the process
-and uses the pipes it already has, so there is no port and nothing to
-authenticate. Needs **`exec`**.
+```ecko norun
+import mcp
 
-```ecko
-mcp.stdio_transport("npx", ["-y", "@some/mcp-server"], { timeout_ms: 30000 })
+session = mcp.connect(mcp.stdio_transport("npx", ["-y", "@modelcontextprotocol/server-everything"]))
+for t in mcp.tools(session) {
+    print("{t.name}: {t.description}")
+}
+print(mcp.text_of(mcp.call_tool(session, "echo", { message: "hi" })))
+
+# Hand every tool to a model; it picks one and Ecko calls it over MCP.
+answer = ai "echo the word ecko" using mcp.as_tools(session)
+mcp.close(session)
 ```
 
-**HTTP** is the shape a hosted server takes. Needs **`net`**.
+A hosted server is a URL. The transport sends the protocol-version header and
+keeps the `Mcp-Session-Id` the server hands out:
 
-```ecko
+```ecko norun
+import std.os
+import mcp
+
 token = secret(os.env("MCP_TOKEN"))
-mcp.http_transport("https://mcp.example.com/", {
-    headers: { Authorization: "Bearer {reveal(token)}" },
-})
+session = mcp.connect(
+    mcp.http_transport(
+        "https://mcp.example.com/",
+        headers: { Authorization: "Bearer {reveal(token)}" },
+    ),
+)
+print(mcp.server_capabilities(session))
+mcp.close(session)
 ```
 
-**`mcp.fake(handler)`** is a transport backed by a function, for tests. Needs no
-capability at all.
+### Being a server
+
+Save this as `words.ecko` and register `ecko words.ecko` with an MCP client:
+
+```ecko norun
+import mcp
+
+mcp.serve_stdio(
+    [
+        mcp.tool(
+            "word_count",
+            "Count the words in some text",
+            { type: "object", properties: { text: { type: "string" } }, required: ["text"] },
+            fn(args) len(filter(split(args.text, " "), fn(w) w != "")),
+        ),
+    ],
+    name: "words",
+    version: "1.0",
+)
+```
+
+`serve_http(port, tools)` serves the same tools over HTTP on `127.0.0.1`.
 
 ## API
 
 ### Client
 
-| call | result |
+| function | returns |
 |---|---|
-| `mcp.connect(transport, info?)` | Handshake and return a session. |
-| `mcp.close(session)` | Close the transport. |
-| `mcp.server_version(session)` / `mcp.server_capabilities(session)` | What the server answered with. |
-| `mcp.tools(session)` | Every tool, following pagination. |
-| `mcp.call_tool(session, name, args?)` | The raw result: `content`, maybe `isError`. |
-| `mcp.text_of(result)` / `mcp.is_error(result)` | The text parts; whether the tool failed. |
-| `mcp.as_tools(session)` / `mcp.as_tool(session, t)` | Tool specs for `ai ... using`. |
-| `mcp.resources(session)` / `mcp.read_resource(session, uri)` | Resources. |
-| `mcp.prompts(session)` / `mcp.get_prompt(session, name, args?)` | Prompts. |
-| `mcp.cancel(session, id, reason?)` / `mcp.next_request_id(session)` | Cancel a request. |
-| `mcp.call(session, method, params?)` / `mcp.notify(...)` | Anything not wrapped above. |
-| `mcp.request(id, method, params?)` / `mcp.notification(method, params?)` / `mcp.encode(message)` | Build and encode a raw JSON-RPC message. |
+| `stdio_transport(command, args = [], timeout_ms = 30000)` | a transport that starts `command` and speaks over its pipes |
+| `http_transport(url, headers = {})` | a Streamable HTTP transport |
+| `fake(handler)` | a transport that hands each decoded request to `handler` in memory |
+| `connect(transport, name = "ecko", version = "0.1.0")` | a session, after the `initialize` handshake |
+| `close(session)` | `null`; stops the server process or ends the HTTP session |
+| `server_version(session)` | the protocol version the server answered with, or `null` |
+| `server_capabilities(session)` | the server's capabilities map (`{}` when it sent none) |
+| `tools(session)` | every tool, `[{ name, description, inputSchema }]`, across all pages |
+| `call_tool(session, name, args = {})` | the raw result: `content`, maybe `isError` |
+| `text_of(result)` | the text parts of a result, joined |
+| `is_error(result)` | `true` when the tool ran and reported failure |
+| `as_tools(session)` | every tool as a spec for `ai ... using` |
+| `as_tool(session, t)` | one tool as a spec for `ai ... using` |
+| `resources(session)` | every resource, `[{ uri, name, mimeType }]`, across all pages |
+| `read_resource(session, uri)` | the resource's contents, `[{ uri, mimeType, text }]` |
+| `prompts(session)` | every prompt template, across all pages |
+| `get_prompt(session, name, args = {})` | the rendered `messages` list |
+| `call(session, method, params = {})` | the result of any request |
+| `notify(session, method, params = {})` | `null`; sends a notification |
+| `cancel(session, request_id, reason = "")` | `null`; sends `notifications/cancelled` |
+| `next_request_id(session)` | the Int id the next request will use |
 
 ### Server
 
-| call | result |
+| function | returns |
 |---|---|
-| `mcp.serve_stdio(offer, info?)` / `mcp.serve_http(port, offer, info?)` | Serve. Blocks. |
-| `mcp.tool(name, description, schema, handler)` | Declare a tool. |
-| `mcp.resource(uri, name, mime, reader)` | Declare a resource. Read lazily. |
-| `mcp.prompt(name, description, arguments, renderer)` | Declare a prompt. |
-| `mcp.handle(request, offer, info?)` | Answer one decoded request (`initialize`, `ping`, and the `tools`, `resources` and `prompts` methods). `null` for a notification. |
-| `mcp.handle_text(text, offer, info?)` | Decode, answer, re-encode. |
-| `mcp.text(value)` / `mcp.tool_error(message)` | Build content; report a tool failure. |
-| `mcp.progress(token, done, total?)` / `mcp.progress_token(request)` | Progress notifications. |
-| `mcp.tools_changed()` / `mcp.resources_changed()` / `mcp.prompts_changed()` | Announce a change. |
+| `tool(name, description, schema, handler)` | a tool declaration |
+| `resource(uri, name, mime_type, reader)` | a resource declaration, read lazily |
+| `prompt(name, description, arguments, renderer)` | a prompt declaration |
+| `text(value)` | text content, `[{ type: "text", text }]` |
+| `tool_error(message)` | a tool result flagged `isError` |
+| `serve_stdio(offer, name = "ecko", version = "0.1.0")` | `null` once standard input closes |
+| `serve_http(port, offer, name = "ecko", version = "0.1.0", host = "127.0.0.1", origins = [])` | blocks until the HTTP server stops |
+| `handle(request, offer, name = "ecko", version = "0.1.0")` | the reply map for one decoded request, or `null` for a notification |
+| `handle_text(text, offer, name = "ecko", version = "0.1.0")` | the reply as JSON text, or `null` for a notification |
+| `progress(token, done, total = null)` | a progress notification, or `null` without a token |
+| `progress_token(request)` | the request's `progressToken`, or `null` |
+| `tools_changed()` | the tool-list-changed notification |
+| `resources_changed()` | the resource-list-changed notification |
+| `prompts_changed()` | the prompt-list-changed notification |
 
-`offer` is `{ tools, resources, prompts }`, each optional. A bare list is taken
-as the tools.
+`offer` is `{ tools, resources, prompts }`, each optional; a bare list is the
+tools.
 
-### Constants
+### Messages and constants
 
-| name | what it is |
+| function | returns |
 |---|---|
-| `mcp.PROTOCOL_VERSION` | The MCP revision this package speaks, shared by both sides so a handshake cannot disagree with itself. |
-| `mcp.PAGE_SIZE` | How many entries a served `*/list` returns per page. |
-| `mcp.MAX_PAGES` | How many pages of a `*/list` the client follows before giving up on a server that never stops paginating. |
-
-## Two kinds of failure, and they are different
-
-- **A JSON-RPC error** means the call was rejected: no such tool, bad argument,
-  server fault. It raises an Ecko error with `kind: "mcp"`, carrying the
-  server's own code and message.
-- **`isError` on a successful result** means the call worked and the *tool*
-  failed. MCP models this as data on purpose so a model can read the failure and
-  try something else. Check it with `mcp.is_error(result)`.
-
-Conflating them tells a model its arguments were wrong when the tool simply does
-not exist.
+| `request(id, method, params = {})` | a JSON-RPC request map |
+| `notification(method, params = {})` | a JSON-RPC notification map |
+| `encode(message)` | the message as JSON text |
+| `PROTOCOL_VERSION` | `"2025-06-18"`, the MCP revision both halves speak |
+| `MAX_PAGES` | `1000`, how many pages of a list the client follows |
+| `PAGE_SIZE` | `100`, how many entries a served list page holds |
 
 ## Notes
 
-**Lists are paginated.** `tools`, `resources` and `prompts` follow `nextCursor`
-to the end. Reading the first page and stopping is the worst kind of bug: a
-short list, and nothing saying it was truncated. A server that repeats a cursor
-is refused rather than looped on.
+### Errors
 
-**Request ids never repeat**, and every reply is checked against the id that
-asked for it. A transport that interleaves messages would otherwise attribute
-someone else's result to your call.
+| kind | reason | when |
+|---|---|---|
+| `mcp` | `server_error` | the server answered with a JSON-RPC error; the error carries its `code` and `detail` |
+| `mcp` | `bad_reply` | the reply is not JSON, has neither result nor error, has no id, is a notification, or an HTTP body holds no reply to the request |
+| `mcp` | `id_mismatch` | the reply answers a different request |
+| `mcp` | `http_status` | the HTTP server answered outside 2xx; carries `status` and `body` |
+| `mcp` | `no_reply` | a stdio server did not reply within `timeout_ms`, or exited |
+| `mcp` | `repeated_cursor` | a server repeated a pagination cursor |
+| `mcp` | `too_many_pages` | a list ran past `MAX_PAGES` pages |
+| `net` | | the HTTP request could not be made |
+| `bug` | `bad_argument` | an argument has the wrong type (the message names the function) |
 
-**A notification is written but not read back.** Reading after one would block
-until the timeout and then take the next reply, misaligning every later call.
+The server half throws only `bug`/`bad_argument`, for a bad declaration or
+offer. Nothing a client sends makes `handle`, `handle_text` or `serve_*`
+throw: a malformed message is a JSON-RPC error reply (-32700 for bad JSON,
+-32600 for an invalid request, -32602 for bad parameters or an unknown cursor,
+tool, resource or prompt, -32601 for an unknown method, -32603 for a fault in
+the server), and the server carries on with the next message.
 
-**Capabilities are computed, not asserted.** A server advertises only the
-sections it actually declared, because a client branches on that.
+### Two kinds of tool failure
 
-**A missing list reads as empty.** A server with no tools may answer `{}`.
+A JSON-RPC error means the call was rejected - no such tool, bad arguments -
+and the client raises `mcp`/`server_error`. `isError` on a result means the
+call worked and the *tool* failed; MCP models this as data so a model can read
+the failure and try something else. Check it with `is_error`. On the server, a
+handler that throws (a map or a plain string) becomes an `isError` result
+carrying the message.
 
-**The HTTP transport sends its body and headers since 0.55.1.** Before that it
-passed both positionally to `http.post`, which read neither, so every request
-went out empty and unauthenticated - a hosted server would have refused it.
+### How the transports behave
 
-## Not implemented
+- Lists are paginated; `tools`, `resources` and `prompts` follow `nextCursor`
+  to the end, and a server that repeats a cursor is refused rather than looped
+  on.
+- Every reply is matched to its request id. On stdio, notifications the server
+  sends in between (logging, progress) are skipped, a server `ping` is
+  answered, any other server request gets error -32601, and a late reply to an
+  earlier request is dropped.
+- On HTTP, a response may be JSON or an SSE stream; the event carrying the
+  reply is picked out of the stream. A notification answered `202` with an
+  empty body is accepted.
+- `serve_http` binds `127.0.0.1` unless given `host:`, and refuses (403) a
+  browser `Origin` that is not loopback or listed in `origins:`, as the spec
+  asks to prevent DNS rebinding.
+
+### Not implemented
 
 Server-to-client requests (sampling, roots, elicitation), resource
-subscriptions, and the OAuth flow for hosted servers. Everything absent fails
-loudly rather than silently.
+subscriptions, the SSE `GET` channel, a way for a tool handler to send progress
+or log notifications, and the OAuth flow for hosted servers.
 
 ## Testing
 
@@ -167,8 +241,9 @@ loudly rather than silently.
 ecko test
 ```
 
-56 cases, all offline against `mcp.fake` - no socket, no subprocess, no API key.
+The suite is offline: the HTTP tests run a server on loopback in the same
+process, and the stdio tests start `ecko` on the scripts in `testdata/`.
 
 ## License
 
-MIT
+[MIT](LICENSE)

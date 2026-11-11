@@ -1,0 +1,68 @@
+# The HTTP transport against this package's own `serve_http`, over loopback.
+# The server runs in this process on a port the OS picks; nothing leaves the
+# machine.
+
+import std.http
+import std.test
+import "../main.ecko"
+mcp = main
+
+fn tools() = [
+    mcp.tool(
+        "wc",
+        "Count words",
+        { type: "object" },
+        fn(a) len(filter(split(a.text, " "), fn(w) w != "")),
+    ),
+]
+
+fn attempt(f) = try { { ok: f() } } catch (e) { { err: e } }
+
+async fn exercise() {
+    mut port = http.port()
+    while port == null {
+        sleep(10)
+        port = http.port()
+    }
+    url = "http://127.0.0.1:{port}/"
+    out = {
+        # connect sends `notifications/initialized`, which the server answers
+        # with an empty 202 - the response that used to fail every connect.
+        connect: attempt(fn() {
+            s = mcp.connect(mcp.http_transport(url))
+            r = mcp.text_of(mcp.call_tool(s, "wc", { text: "a b  c" }))
+            mcp.close(s)
+            r
+        }),
+        bad_origin: attempt(
+            fn() mcp.connect(mcp.http_transport(url, headers: { Origin: "http://evil.example" })),
+        ),
+        local_origin: attempt(fn() {
+            s = mcp.connect(mcp.http_transport(url, headers: { Origin: "http://localhost:3000" }))
+            mcp.server_version(s)
+        }),
+        get: http.get(url).status,
+    }
+    http.stop()
+    out
+}
+
+t = exercise()
+mcp.serve_http(0, tools(), name: "loopback")
+results = await t
+
+test.case("the HTTP client connects to serve_http and calls a tool", fn() {
+    test.eq(get(results.connect, "err"), null)
+    test.eq(results.connect.ok, "3")
+})
+
+test.case("a browser origin that is not local is refused with 403", fn() {
+    e = results.bad_origin.err
+    test.eq([e.kind, e.reason, e.status], ["mcp", "http_status", 403])
+})
+
+test.case("a loopback origin is served", fn() {
+    test.eq(results.local_origin.ok, mcp.PROTOCOL_VERSION)
+})
+
+test.case("GET is answered 405", fn() test.eq(results.get, 405))

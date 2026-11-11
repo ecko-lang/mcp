@@ -90,7 +90,7 @@ fn demo_server() {
 
 # --- the handshake ----------------------------------------------------------
 
-session = mcp.connect(demo_server(), { name: "example", version: "1.0" })
+session = mcp.connect(demo_server(), name: "example", version: "1.0")
 
 print("--- connected ---")
 print("protocol: {mcp.server_version(session)}")
@@ -118,7 +118,7 @@ print("word_count -> {mcp.text_of(result)}")
 missing = try {
     mcp.call_tool(session, "no_such_tool", {})
     "(no error)"
-} catch (e) { e.message }
+} catch (e) { get(e, "message") }
 print("unknown tool -> {missing}")
 print("")
 
@@ -137,9 +137,10 @@ mcp.close(session)
 # Against a real server, the only line that changes is the transport:
 #
 #   session = mcp.connect(
-#       mcp.http_transport("https://mcp.example.com/", {
+#       mcp.http_transport(
+#           "https://mcp.example.com/",
 #           headers: { Authorization: "Bearer {reveal(token)}" },
-#       }),
+#       ),
 #   )
 #
 # and the program needs the `net` capability.

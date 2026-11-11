@@ -1,10 +1,9 @@
 # Transports: how a JSON-RPC message gets to the server and back.
 #
-# A transport is just a map with a `send` function taking wire text and
-# returning wire text. Keeping it a value rather than a hardcoded call is what
-# lets the protocol layer be tested without a server - `fake()` below is the
-# whole test harness - and is where the stdio transport plugs in, driving the
-# child's pipes as streams through `std.io`.
+# A transport is a map with a `send` function taking wire text and returning
+# the wire text of the reply to it ("" for a notification). Keeping it a value
+# rather than a hardcoded call is what lets the protocol layer be tested
+# without a server - `fake()` below is the whole test harness.
 
 import std.http
 import std.proc
@@ -12,105 +11,216 @@ import std.io
 import std.json
 import "./jsonrpc.ecko" as rpc
 
-## An HTTP transport, MCP's "Streamable HTTP" shape: every request is a POST of
-## one JSON-RPC message, and the reply comes back in the response body.
+## An HTTP transport, MCP's "Streamable HTTP" shape: every message is a POST,
+## and the reply comes back in the response body as JSON or as an SSE stream.
 ##
-## `opts` takes `headers` (for `Authorization`, which is how hosted MCP servers
-## authenticate).
+## `headers` are added to every request (for `Authorization`, which is how
+## hosted MCP servers authenticate). The transport sends the
+## `MCP-Protocol-Version` header, and when the server hands out an
+## `Mcp-Session-Id` it echoes it on every later request and ends the session
+## with a `DELETE` on `close`. A notification answered `202` with an empty
+## body is accepted as the spec describes.
 ##
 ## Needs the **net** capability.
-export fn http_transport(url, opts = {}) {
-    mut headers = get(opts, "headers")
-    headers = if is_null(headers) { {} } else { headers }
-    headers = insert(headers, "Content-Type", "application/json")
-    # MCP servers may answer a POST with either JSON or an SSE stream; saying we
-    # accept both is what the spec requires of a Streamable HTTP client.
-    headers = insert(headers, "Accept", "application/json, text/event-stream")
-    { kind: "http", url: url, send: fn(text) {
-        r = http.post(url, body: text, headers: headers)
-        if r.status < 200 or r.status >= 300 {
-            rpc.fail("HTTP {r.status} from {url}", { status: r.status, body: r.body })
-        }
-        body_text(r.body)
-    }, close: fn() null }
-}
-
-## Pull the JSON out of a response body that may be an SSE frame.
 ##
-## A Streamable HTTP server is allowed to answer a POST with `text/event-stream`
-## instead of plain JSON, in which case the payload is on a `data:` line. Doing
-## this here keeps the protocol layer from knowing about either encoding.
-export fn body_text(body) {
-    trimmed = trim(body)
-    if starts_with(trimmed, r"{") or starts_with(trimmed, "[") { return trimmed }
-    mut payload = ""
-    for line in split(trimmed, "\n") {
-        l = trim(line)
-        if starts_with(l, "data:") { payload = payload + trim(l[5..len(l)]) }
+## errors: `bug` when `url` is not a String or `headers` is not a Map. Each
+## send raises `mcp`/`http_status` on a non-2xx answer and `mcp`/`bad_reply`
+## when the body holds no reply to the request; network failures surface as
+## `net`.
+##
+## example:
+##   mcp.http_transport("https://mcp.example.com/", headers: { Authorization: "Bearer t" })
+export fn http_transport(url, headers = {}) {
+    if type_of(url) != "string" {
+        rpc.bad_argument("http_transport", "url must be a String, got {type_of(url)}")
     }
-    if payload == "" { rpc.fail("server sent a body that is neither JSON nor an SSE data frame") }
-    payload
-}
-
-## A transport backed by a table of canned replies, for tests and examples.
-##
-## `handler` takes the decoded request map and returns the reply map. This is
-## what makes the protocol layer testable offline, which the package guide
-## requires and a network round trip would prevent.
-export fn fake(handler) {
-    { kind: "fake", url: "", send: fn(text) {
-        request = json_decode(text)
-        json_encode(handler(request))
-    }, close: fn() null }
-}
-
-## A stdio transport: spawn the server and talk to it over its pipes.
-##
-##   session = mcp.connect(mcp.stdio_transport("npx", ["-y", "@modelcontextprotocol/server-everything"]))
-##
-## This is how almost every MCP server ships - the client starts the process and
-## uses the pipes it already has, so there is no port, no URL and nothing to
-## authenticate. `opts` takes `timeout_ms` (default 30000) for how long to wait
-## on a reply.
-##
-## Needs the **exec** capability to start the process. Nothing here touches the
-## network.
-export fn stdio_transport(command, args = [], opts = {}) {
-    mut timeout = get(opts, "timeout_ms")
-    timeout = if is_null(timeout) { 30000 } else { timeout }
-    child = proc.spawn(command, args)
-    # The child's pipes are streams. The deadline is set once, on the stream
-    # rather than per read, and a read past it raises instead of answering
-    # null - which is what finally separates "the server is slow" from "the
-    # server is gone". `proc.stdout` hands back the same stream every call, so
-    # a line buffered by one read is still there for the next.
-    out = io.timeout(proc.stdout(child), timeout)
-    { kind: "stdio", url: command, process: child, send: fn(text) {
-        # One message per line, which is what the framing requires.
-        io.write(proc.stdin(child), text + "\n")
-        # A notification has no id and gets no reply. Reading anyway would
-        # block until the timeout and then steal the *next* response, which
-        # desynchronises every call after it.
-        if expects_reply(text) {
-            line = try {
-                io.read_line(out)
-            } catch (e) {
-                rpc.fail("no reply from '{command}' within {timeout}ms")
-            }
-            if is_null(line) { rpc.fail("'{command}' closed its output without replying") }
-            line
-        } else { "" }
+    if type_of(headers) != "map" {
+        rpc.bad_argument("http_transport", "headers must be a Map, got {type_of(headers)}")
+    }
+    base = merge(headers, {
+        "Content-Type": "application/json",
+        # MCP servers may answer a POST with either JSON or an SSE stream;
+        # saying we accept both is what the spec requires of a client.
+        Accept: "application/json, text/event-stream",
+        "MCP-Protocol-Version": rpc.PROTOCOL_VERSION,
+    })
+    # The session id is learned from the first response and sent from then on.
+    # A cell, because the transport is passed by value.
+    session_id = cell(null)
+    with_session = fn() {
+        sid = cell_get(session_id)
+        if is_null(sid) { base } else { insert(base, "Mcp-Session-Id", sid) }
+    }
+    { kind: "http", url: url, send: fn(text) {
+        r = http.post(url, body: text, headers: with_session())
+        if r.status < 200 or r.status >= 300 {
+            rpc.fail(
+                "http_status",
+                "HTTP {r.status} from {url}",
+                { status: r.status, body: r.body },
+            )
+        }
+        sid = get(r.headers, "mcp-session-id")
+        unless is_null(sid) { cell_set(session_id, sid) }
+        id = rpc.outgoing_id(text)
+        # A notification has nothing to read back; the spec's answer is a
+        # 202 with an empty body.
+        if is_null(id) { return "" }
+        body_text(r.body, id)
     }, close: fn() {
-        io.close(proc.stdin(child))
-        proc.kill(child)
+        sid = cell_get(session_id)
+        # Ending the session is a courtesy the spec asks for; a server that
+        # does not support it answers 405, and either way we are done.
+        unless is_null(sid) {
+            try { http.delete(url, headers: with_session()) }
+            cell_set(session_id, null)
+        }
+        null
     } }
 }
 
-## Whether an outgoing message is a request rather than a notification.
+# The JSON text of the reply to request `id` in a response body, which is
+# either one JSON object or an SSE stream.
+#
+# An SSE stream may carry notifications and server requests before the reply,
+# and each event's payload may span several `data:` lines (joined by newlines,
+# per the SSE format), so events are split on blank lines and the one whose id
+# matches is returned.
+export fn body_text(body, id = null) {
+    trimmed = trim(body)
+    if trimmed == "" {
+        rpc.fail(
+            "bad_reply",
+            "server sent an empty body where the reply to request {id} was expected",
+        )
+    }
+    if starts_with(trimmed, r"{") or starts_with(trimmed, "[") { return trimmed }
+    mut events = []
+    mut data = []
+    for raw in split(trimmed + "\n\n", "\n") {
+        line = replace(raw, "\r", "")
+        if line == "" {
+            if len(data) > 0 { events = push(events, join(data, "\n")) }
+            data = []
+        } else if starts_with(line, "data:") {
+            mut d = line[5..len(line)]
+            if starts_with(d, " ") { d = d[1..len(d)] }
+            data = push(data, d)
+        }
+    }
+    if len(events) == 0 {
+        rpc.fail("bad_reply", "server sent a body that is neither JSON nor an SSE data frame")
+    }
+    if is_null(id) { return events[0] }
+    for e in events {
+        m = try { json.decode(e) } catch (err) { null }
+        if type_of(m) == "map" and not contains(keys(m), "method") and get(m, "id") == id {
+            return e
+        }
+    }
+    rpc.fail("bad_reply", "server's event stream carried no reply to request {id}")
+}
+
+## A transport backed by a function, for tests and examples. Needs no
+## capability.
 ##
-## Decided from the wire text because that is what the transport has: a request
-## carries an id, a notification does not.
-export fn expects_reply(text) {
-    decoded = try { json.decode(text) } catch (e) { return true }
-    type_of(decoded) == "map" and not is_null(get(decoded, "id"))
+## `handler` takes the decoded request map and returns the reply map. It is
+## called for notifications too, and what it returns for one is ignored.
+##
+## errors: `bug` when `handler` is not a function.
+##
+## example:
+##   t = mcp.fake(fn(req) { jsonrpc: "2.0", id: get(req, "id"), result: {} })
+export fn fake(handler) {
+    if type_of(handler) != "function" {
+        rpc.bad_argument("fake", "handler must be a function, got {type_of(handler)}")
+    }
+    { kind: "fake", url: "", send: fn(text) {
+        reply = handler(json.decode(text))
+        if is_null(rpc.outgoing_id(text)) { "" } else { json.encode(reply) }
+    }, close: fn() null }
+}
+
+## A stdio transport: spawn the server and talk to it over its pipes, one
+## JSON message per line.
+##
+## This is how almost every MCP server ships - the client starts the process and
+## uses the pipes it already has, so there is no port, no URL and nothing to
+## authenticate. `timeout_ms` bounds the wait for each reply.
+##
+## Messages the server sends between a request and its reply are dealt with
+## rather than mistaken for the reply: notifications (logging, progress) are
+## skipped, a `ping` is answered, and any other server request is answered with
+## JSON-RPC error -32601, since this client offers no server-side features.
+##
+## Needs the **exec** capability to start the process. Nothing here touches the
+## network.
+##
+## errors: `bug` when `command` is not a String, `args` is not a List or
+## `timeout_ms` is not a positive Int. Each send raises `mcp`/`no_reply` when
+## the server does not answer in time or exits, and `mcp`/`bad_reply` when it
+## writes a line that is not JSON.
+##
+## example:
+##   mcp.stdio_transport("npx", ["-y", "@modelcontextprotocol/server-everything"], timeout_ms: 10000)
+export fn stdio_transport(command, args = [], timeout_ms = 30000) {
+    if type_of(command) != "string" {
+        rpc.bad_argument("stdio_transport", "command must be a String, got {type_of(command)}")
+    }
+    if type_of(args) != "list" {
+        rpc.bad_argument("stdio_transport", "args must be a List, got {type_of(args)}")
+    }
+    if type_of(timeout_ms) != "int" or timeout_ms <= 0 {
+        rpc.bad_argument("stdio_transport", "timeout_ms must be a positive Int, got {timeout_ms}")
+    }
+    child = proc.spawn(command, args)
+    # The deadline is set once, on the stream: a read past it raises instead of
+    # answering null, which separates "the server is slow" from "it is gone".
+    out = io.timeout(proc.stdout(child), timeout_ms)
+    input = proc.stdin(child)
+    { kind: "stdio", url: command, process: child, send: fn(text) {
+        io.write(input, text + "\n")
+        id = rpc.outgoing_id(text)
+        # A notification gets no reply. Reading anyway would block until the
+        # timeout and then steal the *next* response.
+        if is_null(id) { return "" }
+        loop {
+            line = try {
+                io.read_line(out)
+            } catch (e) {
+                rpc.fail("no_reply", "no reply from '{command}' within {timeout_ms}ms")
+            }
+            if is_null(line) {
+                rpc.fail("no_reply", "'{command}' closed its output without replying")
+            }
+            trimmed = trim(line)
+            if trimmed == "" { continue }
+            m = rpc.decode_message(trimmed)
+            if type_of(m) == "map" and contains(keys(m), "method") {
+                # A server request needs an answer or the server waits on it.
+                unless is_null(get(m, "id")) { io.write(input, answer_server_request(m) + "\n") }
+                continue
+            }
+            # A reply to some earlier request that timed out is stale.
+            if type_of(m) == "map" and not is_null(get(m, "id")) and m["id"] != id { continue }
+            return trimmed
+        }
+    }, close: fn() {
+        try { io.close(input) }
+        try { proc.kill(child) }
+        null
+    } }
+}
+
+# Answer a request the server sent us. A ping is answered; nothing else is
+# offered by this client.
+fn answer_server_request(m) {
+    if m["method"] == "ping" { return json.encode({ jsonrpc: "2.0", id: m["id"], result: {} }) }
+    json.encode(
+        {
+            jsonrpc: "2.0",
+            id: m["id"],
+            error: { code: -32601, message: "method not found: {m["method"]}" },
+        },
+    )
 }

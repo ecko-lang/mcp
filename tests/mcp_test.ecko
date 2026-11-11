@@ -45,7 +45,7 @@ test.case("connect sends initialize and then the initialized notification", fn()
 
 test.case("connect sends the protocol version and client info", fn() {
     s = server(basic())
-    mcp.connect(s.transport, { name: "app", version: "2.0" })
+    mcp.connect(s.transport, name: "app", version: "2.0")
     p = cell_get(s.seen)[0].params
     test.ok(p.protocolVersion == mcp.PROTOCOL_VERSION, "p.protocolVersion == mcp.PROTOCOL_VERSION")
     test.ok(p.clientInfo.name == "app", "p.clientInfo.name == 'app'")
@@ -199,8 +199,8 @@ test.case("an error carries kind mcp so a caller can match on it", fn() {
     k = try {
         mcp.call_tool(session, "x")
         ""
-    } catch (e) { e.kind }
-    test.ok(k == "mcp", "k == 'mcp'")
+    } catch (e) { [get(e, "kind"), get(e, "reason"), get(e, "code")] }
+    test.eq(k, ["mcp", "server_error", -1])
 })
 
 test.case("a reply whose id does not match the request is refused", fn() {
@@ -268,4 +268,94 @@ test.case("a body that is neither JSON nor an SSE frame is refused", fn() {
         contains(caught, "neither JSON nor an SSE"),
         "contains(caught, 'neither JSON nor an SSE')",
     )
+})
+
+test.case("an SSE stream with a notification first yields the reply", fn() {
+    note = json.encode(
+        { jsonrpc: "2.0", method: "notifications/message", params: { level: "info" } },
+    )
+    reply = json.encode({ jsonrpc: "2.0", id: 3, result: 9 })
+    body = "event: message\ndata: {note}\n\nevent: message\ndata: {reply}\n\n"
+    test.eq(jsonrpc.reply_for(3, transport.body_text(body, 3)), 9)
+})
+
+test.case("an SSE event split over several data lines is joined", fn() {
+    body = "data: \{\"jsonrpc\": \"2.0\",\r\ndata:  \"id\": 4, \"result\": 1}\r\n\r\n"
+    test.eq(jsonrpc.reply_for(4, transport.body_text(body, 4)), 1)
+})
+
+test.case("an SSE stream with no reply to the request is refused", fn() {
+    other = json.encode({ jsonrpc: "2.0", id: 2, result: 1 })
+    r = try { transport.body_text("data: {other}\n\n", 5) } catch (e) { get(e, "reason") }
+    test.eq(r, "bad_reply")
+})
+
+test.case("an empty body where a reply was expected is refused", fn() {
+    r = try { transport.body_text("", 1) } catch (e) { get(e, "reason") }
+    test.eq(r, "bad_reply")
+})
+
+# ---------------------------------------------------------- reply matching
+
+test.case("a reply with no id is refused unless it is an error", fn() {
+    r = try {
+        jsonrpc.reply_for(1, json.encode({ jsonrpc: "2.0", result: 1 }))
+    } catch (e) {
+        get(e, "reason")
+    }
+    test.eq(r, "bad_reply")
+    e2 = try {
+        jsonrpc.reply_for(
+            1,
+            json.encode(
+                { jsonrpc: "2.0", id: null, error: { code: -32700, message: "parse error" } },
+            ),
+        )
+    } catch (e) { [get(e, "reason"), get(e, "code")] }
+    test.eq(e2, ["server_error", -32700])
+})
+
+test.case("a notification is never taken as the reply", fn() {
+    note = json.encode({ jsonrpc: "2.0", method: "notifications/progress", params: {} })
+    r = try { jsonrpc.reply_for(1, note) } catch (e) { get(e, "reason") }
+    test.eq(r, "bad_reply")
+})
+
+test.case("a reply that is not JSON is an mcp error, not a parse error", fn() {
+    r = try { jsonrpc.reply_for(1, "<html>") } catch (e) { [get(e, "kind"), get(e, "reason")] }
+    test.eq(r, ["mcp", "bad_reply"])
+})
+
+test.case("a mismatched id has its own reason", fn() {
+    r = try {
+        jsonrpc.reply_for(1, json.encode({ jsonrpc: "2.0", id: 2, result: 1 }))
+    } catch (e) {
+        get(e, "reason")
+    }
+    test.eq(r, "id_mismatch")
+})
+
+test.case("the fake transport reads nothing back for a notification", fn() {
+    t = mcp.fake(fn(req) null)
+    test.eq(t.send(mcp.encode(mcp.notification("notifications/initialized"))), "")
+})
+
+test.case("wrong argument types are bugs raised at the boundary", fn() {
+    for f in [
+        fn() mcp.http_transport(5),
+        fn() mcp.http_transport("http://x", headers: "a"),
+        fn() mcp.stdio_transport("x", "not a list"),
+        fn() mcp.stdio_transport("x", [], timeout_ms: 0),
+        fn() mcp.fake("no"),
+        fn() mcp.connect({}),
+        fn() mcp.request(null, "x"),
+    ] {
+        e = try {
+            f()
+            null
+        } catch (e) { e }
+        test.eq(get(e, "kind"), "bug")
+        test.eq(get(e, "reason"), "bad_argument")
+        test.ok(starts_with(e.message, "mcp."), "names the function: {e.message}")
+    }
 })

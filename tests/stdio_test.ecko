@@ -1,0 +1,32 @@
+# The stdio transport and `serve_stdio`, each against a real child process
+# (`ecko` running a fixture under testdata/). Offline and deterministic.
+
+import std.json
+import std.test
+import "../main.ecko"
+mcp = main
+
+fn ecko_child(fixture) = mcp.stdio_transport("ecko", ["testdata/{fixture}"], timeout_ms: 20000)
+
+test.case("notifications, server pings and stale replies are not taken as the reply", fn() {
+    s = mcp.connect(ecko_child("noisy_server.ecko"))
+    test.eq(mcp.server_version(s), "2025-06-18")
+    # By the second request the server has seen our answers to its pings
+    # during initialize (one) - proof they were answered, not swallowed.
+    text = mcp.text_of(mcp.call_tool(s, "x"))
+    mcp.close(s)
+    test.eq(text, "pings answered: 1")
+})
+
+test.case("one bad request does not kill the stdio server", fn() {
+    t = ecko_child("stdio_server.ecko")
+    send = fn(m) json.decode(t.send(json.encode(m)))
+    bad_cursor = send({ jsonrpc: "2.0", id: 1, method: "tools/list", params: { cursor: "abc" } })
+    test.eq(bad_cursor.error.code, -32602)
+    boom = send({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "boom" } })
+    test.ok(boom.result.isError, "a string thrown by a tool is a tool error")
+    test.ok(contains(boom.result.content[0].text, "boom"), "carries the message")
+    # Still alive after both.
+    test.eq(send({ jsonrpc: "2.0", id: 3, method: "ping" }).result, {})
+    t.close()
+})

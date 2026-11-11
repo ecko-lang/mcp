@@ -5,7 +5,7 @@
 import std.test
 import std.json
 import "../main.ecko"
-import "../transport.ecko"
+import "../jsonrpc.ecko"
 srv = main
 
 fn tools() = [
@@ -30,7 +30,7 @@ fn everything() = { tools: tools(), resources: resources(), prompts: prompts() }
 fn mcp_session() {
     offered = everything()
     let transport = srv.fake(fn(request) {
-        reply = srv.handle(request, offered, { name: "loopback" })
+        reply = srv.handle(request, offered, name: "loopback")
         if is_null(reply) { { jsonrpc: "2.0", id: null, result: {} } } else { reply }
     })
     srv.connect(transport)
@@ -43,7 +43,7 @@ fn req(id, method, params = {}) = { jsonrpc: "2.0", id: id, method: method, para
 test.case("initialize answers with the shared protocol version", fn() {
     # One constant for both directions: a client and a server that disagree
     # fail a handshake, and two declarations drift the moment MCP revs.
-    r = srv.handle(req(1, "initialize"), tools(), { name: "demo", version: "2.0" })
+    r = srv.handle(req(1, "initialize"), tools(), name: "demo", version: "2.0")
     test.eq(r.result.protocolVersion, srv.PROTOCOL_VERSION)
     test.eq(r.result.serverInfo.name, "demo")
 })
@@ -242,11 +242,20 @@ test.case("a list that fits one page carries no cursor", fn() {
 })
 
 test.case("a bad cursor is refused rather than silently clamped", fn() {
-    caught = try {
-        srv.handle(req(1, "tools/list", { cursor: "99999" }), many_tools(3))
-        "no error"
-    } catch (e) { e.message }
-    test.ok(contains(caught, "cursor"), "names the problem: {caught}")
+    r = srv.handle(req(1, "tools/list", { cursor: "99999" }), many_tools(3))
+    test.eq(r.error.code, -32602)
+    test.ok(contains(r.error.message, "cursor"), "names the problem")
+})
+
+test.case("a non-numeric or negative cursor is a -32602 reply, not a throw", fn() {
+    # One client sending a cursor this server never issued used to kill the
+    # whole stdio server with an uncaught int() error.
+    for c in ["abc", "-1", "01", "1.5", 3] {
+        for m in ["tools/list", "resources/list", "prompts/list"] {
+            r = srv.handle(req(1, m, { cursor: c }), everything())
+            test.eq(r.error.code, -32602)
+        }
+    }
 })
 
 test.case("the client follows cursors to the end of the list", fn() {
@@ -255,7 +264,7 @@ test.case("the client follows cursors to the end of the list", fn() {
     # about the rest.
     offered = many_tools(srv.PAGE_SIZE + 42)
     session = srv.connect(srv.fake(fn(request) {
-        r = srv.handle(request, offered, { name: "paged" })
+        r = srv.handle(request, offered, name: "paged")
         if is_null(r) { { jsonrpc: "2.0", id: null, result: {} } } else { r }
     }))
     test.eq(len(srv.tools(session)), srv.PAGE_SIZE + 42)
@@ -286,7 +295,7 @@ test.case("cancel sends a notification, not a request", fn() {
     seen = cell([])
     session = srv.connect(srv.fake(fn(request) {
         cell_update(seen, fn(v) push(v, request))
-        r = srv.handle(request, tools(), { name: "t" })
+        r = srv.handle(request, tools(), name: "t")
         if is_null(r) { { jsonrpc: "2.0", id: null, result: {} } } else { r }
     }))
     srv.cancel(session, 7, "user pressed stop")
@@ -302,7 +311,7 @@ test.case("the id a call will use is knowable before sending it", fn() {
     seen = cell([])
     session = srv.connect(srv.fake(fn(request) {
         cell_update(seen, fn(v) push(v, request))
-        r = srv.handle(request, tools(), { name: "t" })
+        r = srv.handle(request, tools(), name: "t")
         if is_null(r) { { jsonrpc: "2.0", id: null, result: {} } } else { r }
     }))
     expected = srv.next_request_id(session)
@@ -341,18 +350,85 @@ test.case("list-changed notifications carry no id", fn() {
 
 # ------------------------------------------------------ the stdio transport
 
-test.case("a request expects a reply and a notification does not", fn() {
-    # The whole reason stdio needs this distinction: reading after a
+test.case("a request carries an id and a notification does not", fn() {
+    # The whole reason a transport needs this distinction: reading after a
     # notification blocks until the timeout and then steals the *next*
     # response, which desynchronises every call after it.
     request = json.encode({ jsonrpc: "2.0", id: 1, method: "tools/list" })
     note = json.encode({ jsonrpc: "2.0", method: "notifications/initialized" })
-    test.ok(transport.expects_reply(request), "a request expects a reply")
-    test.ok(not transport.expects_reply(note), "a notification does not")
+    test.eq(jsonrpc.outgoing_id(request), 1)
+    test.ok(is_null(jsonrpc.outgoing_id(note)), "a notification has no id")
 })
 
-test.case("unparseable outgoing text is assumed to expect a reply", fn() {
-    # Guessing wrong in this direction times out; guessing wrong the other way
-    # silently misaligns every later call, which is far worse.
-    test.ok(transport.expects_reply("not json"), "unknown text is treated as a request")
+# ------------------------------------------------- one bad request, one reply
+
+test.case("a handler that throws a string becomes a tool error", fn() {
+    t = [srv.tool("str", "", {}, fn(a) error("boom"))]
+    r = srv.handle(req(1, "tools/call", { name: "str", arguments: {} }), t)
+    test.ok(r.result.isError, "flagged as a tool error")
+    test.ok(contains(r.result.content[0].text, "boom"), "carries the thrown string")
+})
+
+test.case("a reader or renderer that throws a string is -32603", fn() {
+    offer = {
+        resources: [srv.resource("memo://s", "s", "text/plain", fn() error("gone"))],
+        prompts: [srv.prompt("p", "", [], fn(a) error("bad"))],
+    }
+    r = srv.handle(req(1, "resources/read", { uri: "memo://s" }), offer)
+    test.eq(r.error.code, -32603)
+    test.ok(contains(r.error.message, "gone"), "carries the thrown string")
+    r2 = srv.handle(req(2, "prompts/get", { name: "p" }), offer)
+    test.eq(r2.error.code, -32603)
+})
+
+test.case("a request that is not an object or has no method is -32600", fn() {
+    test.eq(srv.handle([1], tools()).error.code, -32600)
+    test.eq(srv.handle(5, tools()).error.code, -32600)
+    test.eq(srv.handle({ jsonrpc: "2.0", id: 1 }, tools()).error.code, -32600)
+    test.eq(srv.handle({ jsonrpc: "2.0", id: 1, method: 7 }, tools()).error.code, -32600)
+    test.eq(srv.handle({ jsonrpc: "2.0", id: [1], method: "ping" }, tools()).error.code, -32600)
+})
+
+test.case("params or arguments of the wrong shape are -32602", fn() {
+    test.eq(
+        srv.handle({ jsonrpc: "2.0", id: 1, method: "ping", params: [1] }, tools()).error.code,
+        -32602,
+    )
+    r = srv.handle(req(1, "tools/call", { name: "wc", arguments: "text" }), tools())
+    test.eq(r.error.code, -32602)
+})
+
+test.case("a fault inside the server is -32603 and the server keeps answering", fn() {
+    # A tool list holding something that is not a tool breaks tools/list.
+    offer = { tools: ["not a tool"] }
+    r = srv.handle(req(1, "tools/list"), offer)
+    test.eq(r.error.code, -32603)
+    test.eq(srv.handle(req(2, "ping"), offer).result, {})
+})
+
+test.case("handle_text answers anything with JSON and never throws", fn() {
+    for text in [
+        "[1]",
+        "5",
+        "null",
+        r"""{"id":1}""",
+        r"""{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"cursor":"abc"}}""",
+    ] {
+        out = json.decode(srv.handle_text(text, tools()))
+        test.ok(not is_null(get(out, "error")), "an error reply for {text}")
+    }
+})
+
+test.case("a result that is not JSON is -32603, not a throw", fn() {
+    t = [srv.tool("f", "", {}, fn(a) ({ content: [{ type: "text", text: fn() 1 }] }))]
+    out = srv.handle_text(json.encode(req(9, "tools/call", { name: "f", arguments: {} })), t)
+    test.eq(json.decode(out).error.code, -32603)
+    test.eq(json.decode(out).id, 9)
+})
+
+test.case("declaring a tool with the wrong argument types is a bug", fn() {
+    k = try { srv.tool("x", "d", {}, "not a function") } catch (e) { get(e, "kind") }
+    test.eq(k, "bug")
+    k2 = try { srv.handle(req(1, "ping"), "tools") } catch (e) { get(e, "reason") }
+    test.eq(k2, "bad_argument")
 })

@@ -1,0 +1,9 @@
+# This package's own `serve_stdio`, for tests/stdio_test.ecko.
+
+import "../main.ecko"
+mcp = main
+
+mcp.serve_stdio(
+    [mcp.tool("boom", "Always throws a string", { type: "object" }, fn(a) error("boom"))],
+    name: "fixture",
+)

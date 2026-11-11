@@ -1,21 +1,24 @@
-# mcp - a Model Context Protocol client.
+# mcp - the Model Context Protocol, both directions.
 #
 #   import mcp
 #
-#   s = mcp.connect(mcp.http_transport("https://example.com/mcp"))
+#   s = mcp.connect(mcp.stdio_transport("my-mcp-server"))
 #   for t in mcp.tools(s) { print(t.name) }
-#   print(mcp.text_of(mcp.call_tool(s, "search", { query: "ecko" })))
+#
+#   mcp.serve_stdio([mcp.tool("echo", "Repeat", { type: "object" }, fn(a) a.text)])
 #
 # MCP is JSON-RPC 2.0 with a fixed vocabulary: a handshake, then tools,
-# resources and prompts. This package speaks the HTTP transport; the transport
-# is a value, so a stdio one drops in without touching the protocol layer.
+# resources and prompts. The client half talks to a server over stdio or
+# Streamable HTTP; the transport is a value, so `fake` stands in for a server
+# in tests. The server half answers the same protocol over stdio or HTTP.
 #
-# Needs the **net** capability for the HTTP transport, and none for a fake one.
+# Needs **exec** for the stdio client, **net** for HTTP, and nothing for a fake
+# transport or a stdio server.
 
-# Selective on purpose. `fail`, `result_of`, `reply_for`, `is_notification`,
-# `body_text` and `expects_reply` stay exported by their own files so sibling
-# modules and the tests can reach them, but they are wire-protocol plumbing
-# rather than API - a blanket `export *` would publish all six as `mcp.*`.
+# Selective on purpose. jsonrpc.ecko and transport.ecko export wire-protocol
+# helpers (`fail`, `result_of`, `reply_for`, `body_text`, ...) so sibling files
+# and the tests can reach them; they are not API, and `export *` would publish
+# them as `mcp.*`.
 export { PROTOCOL_VERSION, request, notification, encode } from "./jsonrpc.ecko"
 export { http_transport, fake, stdio_transport } from "./transport.ecko"
 export * from "./client.ecko"

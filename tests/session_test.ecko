@@ -1,0 +1,86 @@
+# The HTTP transport against a scripted Streamable HTTP server that does what
+# hosted servers do: hand out an `Mcp-Session-Id`, refuse requests without it,
+# answer over SSE with a notification ahead of the reply, answer notifications
+# with an empty 202, and end the session on DELETE. Loopback only.
+
+import std.http
+import std.json
+import std.test
+import "../main.ecko"
+mcp = main
+
+seen = cell([])
+
+fn sse(messages) = http.response(
+    200,
+    join(map(messages, fn(m) "event: message\ndata: {json.encode(m)}\n\n"), ""),
+    { "Content-Type": "text/event-stream", "Mcp-Session-Id": "sess-1" },
+)
+
+fn handler(req) {
+    cell_update(
+        seen,
+        fn(s) push(
+            s,
+            {
+                method: req.method,
+                session: get(req.headers, "mcp-session-id"),
+                version: get(req.headers, "mcp-protocol-version"),
+            },
+        ),
+    )
+    if req.method == "DELETE" { return http.response(204, "", {}) }
+    m = json.decode(req.body)
+    if m.method != "initialize" and get(req.headers, "mcp-session-id") != "sess-1" {
+        return http.response(400, "missing session", {})
+    }
+    if is_null(get(m, "id")) { return http.response(202, "", {}) }
+    note = {
+        jsonrpc: "2.0",
+        method: "notifications/message",
+        params: { level: "info", data: "hi" },
+    }
+    result = if m.method == "initialize" {
+        { protocolVersion: mcp.PROTOCOL_VERSION, capabilities: { tools: {} } }
+    } else {
+        { content: [{ type: "text", text: "pong" }] }
+    }
+    sse([note, { jsonrpc: "2.0", id: m.id, result: result }])
+}
+
+async fn exercise() {
+    mut port = http.port()
+    while port == null {
+        sleep(10)
+        port = http.port()
+    }
+    out = try {
+        s = mcp.connect(mcp.http_transport("http://127.0.0.1:{port}/mcp"))
+        text = mcp.text_of(mcp.call_tool(s, "anything"))
+        mcp.close(s)
+        { ok: text }
+    } catch (e) { { err: e } }
+    http.stop()
+    out
+}
+
+t = exercise()
+http.serve(0, handler, host: "127.0.0.1")
+outcome = await t
+requests = cell_get(seen)
+
+test.case("the session id is echoed and the reply is picked out of the SSE stream", fn() {
+    test.eq(get(outcome, "err"), null)
+    test.eq(outcome.ok, "pong")
+})
+
+test.case("every request after initialize carries the session id", fn() {
+    test.eq(map(requests, fn(r) r.method), ["POST", "POST", "POST", "DELETE"])
+    test.eq(map(requests, fn(r) r.session), [null, "sess-1", "sess-1", "sess-1"])
+})
+
+test.case("every request carries the protocol version header", fn() {
+    for r in requests {
+        test.eq(r.version, mcp.PROTOCOL_VERSION)
+    }
+})
